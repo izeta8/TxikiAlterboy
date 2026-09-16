@@ -10,6 +10,8 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <iterator>
 #include <fstream>
 #include <numeric>
 #include <string>
@@ -235,6 +237,146 @@ static double inharmonicDb (const std::vector<float>& x, double sr, size_t start
     return 10 * std::log10 ((inh + 1e-30) / (harm + 1e-30));
 }
 
+// Minimal 16-bit PCM / 32-bit float WAV reader (first channel).
+static std::vector<float> readWav (const std::string& path, int& sampleRate)
+{
+    std::ifstream f (path, std::ios::binary);
+    std::vector<char> bytes ((std::istreambuf_iterator<char> (f)), std::istreambuf_iterator<char>());
+    std::vector<float> out;
+    if (bytes.size() < 12 || std::string (bytes.data(), 4) != "RIFF")
+        return out;
+    auto u16 = [&] (size_t o) { return (uint16_t) ((uint8_t) bytes[o] | ((uint8_t) bytes[o + 1] << 8)); };
+    auto u32 = [&] (size_t o) { return (uint32_t) u16 (o) | ((uint32_t) u16 (o + 2) << 16); };
+    int format = 1, channels = 1, bits = 16;
+    size_t pos = 12;
+    while (pos + 8 <= bytes.size())
+    {
+        const std::string id (bytes.data() + pos, 4);
+        const size_t len = u32 (pos + 4);
+        if (id == "fmt ")
+        {
+            format = u16 (pos + 8);
+            channels = u16 (pos + 10);
+            sampleRate = (int) u32 (pos + 12);
+            bits = u16 (pos + 22);
+        }
+        else if (id == "data")
+        {
+            const size_t frameBytes = (size_t) channels * bits / 8;
+            for (size_t i = pos + 8; i + frameBytes <= pos + 8 + len && i + frameBytes <= bytes.size(); i += frameBytes)
+            {
+                if (format == 3 && bits == 32)
+                {
+                    float v;
+                    std::memcpy (&v, &bytes[i], 4);
+                    out.push_back (v);
+                }
+                else if (bits == 16)
+                    out.push_back ((int16_t) u16 (i) / 32768.0f);
+            }
+            break;
+        }
+        pos += 8 + len + (len & 1);
+    }
+    return out;
+}
+
+// Count 2 ms frames whose high-frequency (2nd difference) energy jumps > 15 dB above both neighbours.
+static int countClicks (const std::vector<float>& x, double sr)
+{
+    const size_t frame = (size_t) (0.002 * sr);
+    std::vector<double> e;
+    for (size_t s = 2; s + frame < x.size(); s += frame)
+    {
+        double acc = 0;
+        for (size_t i = s; i < s + frame; ++i)
+        {
+            const double d2 = x[i] - 2.0 * x[i - 1] + x[i - 2];
+            acc += d2 * d2;
+        }
+        e.push_back (acc / frame);
+    }
+    int clicks = 0;
+    const double floor = std::pow (10.0, -70.0 / 10.0);
+    for (size_t i = 1; i + 1 < e.size(); ++i)
+        if (e[i] > floor && e[i] > 31.6 * e[i - 1] && e[i] > 31.6 * e[i + 1])
+            ++clicks;
+    return clicks;
+}
+
+static int processVoiceFile (const std::string& path, const std::string& outDir)
+{
+    int sr = 48000;
+    const auto input = readWav (path, sr);
+    if (input.empty())
+    {
+        std::printf ("could not read %s\n", path.c_str());
+        return 1;
+    }
+    const std::string base = path.substr (path.find_last_of ("/\\") + 1, path.find_last_of ('.') - path.find_last_of ("/\\") - 1);
+    const int inputClicks = countClicks (input, sr);
+    std::printf ("\n%s: %.1fs @%d Hz, input clicks=%d\n", base.c_str(), input.size() / (double) sr, sr, inputClicks);
+
+    struct Setting { const char* name; Mode mode; float pitch, formant; bool link; };
+    const Setting settings[] = {
+        { "up5", Mode::Transpose, 5.0f, 0.0f, false },
+        { "down7", Mode::Transpose, -7.0f, 0.0f, false },
+        { "down12", Mode::Transpose, -12.0f, 0.0f, false },
+        { "formant+4", Mode::Transpose, 0.0f, 4.0f, false },
+        { "formant-4", Mode::Transpose, 0.0f, -4.0f, false },
+        { "link+7", Mode::Transpose, 7.0f, 0.0f, true },
+        { "quantize", Mode::Quantize, 0.0f, 0.0f, false },
+        { "robot", Mode::Robot, 0.0f, 0.0f, false },
+    };
+    int failures = 0;
+    for (const auto& st : settings)
+    {
+        VoiceShifter vs;
+        vs.prepare (sr);
+        vs.setParameters (st.mode, st.pitch, st.formant, st.link);
+        const int lat = vs.getLatencySamples();
+        std::vector<float> out (input.size() + (size_t) lat);
+        std::vector<float> hzTrack;
+        for (size_t i = 0; i < out.size(); ++i)
+        {
+            out[i] = vs.processSample (i < input.size() ? input[i] : 0.0f);
+            if (i % 256 == 0)
+                hzTrack.push_back (vs.getDetectedHz());
+        }
+        out.erase (out.begin(), out.begin() + lat);
+
+        int voiced = 0, octaveJumps = 0;
+        for (size_t i = 0; i < hzTrack.size(); ++i)
+        {
+            if (hzTrack[i] > 0)
+                ++voiced;
+            if (i > 0 && hzTrack[i] > 0 && hzTrack[i - 1] > 0 && std::abs (12.0 * std::log2 (hzTrack[i] / hzTrack[i - 1])) > 7.0)
+            {
+                ++octaveJumps;
+                if (std::getenv ("TXIKI_VERBOSE") && st.mode == Mode::Transpose && st.pitch == 5.0f)
+                    std::printf ("    jump @%.3fs: %.1f -> %.1f -> %.1f -> %.1f Hz\n", i * 256.0 / sr, i > 1 ? hzTrack[i - 2] : 0.0f, hzTrack[i - 1], hzTrack[i],
+                                 i + 1 < hzTrack.size() ? hzTrack[i + 1] : 0.0f);
+            }
+        }
+        double eIn = 0, eOut = 0;
+        for (size_t i = 0; i < input.size(); ++i)
+        {
+            eIn += (double) input[i] * input[i];
+            eOut += (double) out[i] * out[i];
+        }
+        std::printf ("  %-10s clicks=%3d (input %d)  level=%+5.1f dB  voiced=%3.0f%%  pitch jumps>7st=%d\n", st.name, countClicks (out, sr),
+                     inputClicks, 10.0 * std::log10 (eOut / eIn), 100.0 * voiced / hzTrack.size(), octaveJumps);
+        writeWav (outDir + "/voice_" + base + "_" + st.name + ".wav", out, sr);
+        const double levelDb = 10.0 * std::log10 (eOut / eIn);
+        if (octaveJumps > 0 || std::abs (levelDb) > 3.0 || countClicks (out, sr) > inputClicks + 5)
+        {
+            std::printf ("    ^ FAIL\n");
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 struct Case
 {
     std::string name;
@@ -248,6 +390,14 @@ struct Case
 
 int main (int argc, char** argv)
 {
+    if (argc > 3 && std::string (argv[1]) == "--voices")
+    {
+        int rc = 0;
+        for (int i = 3; i < argc; ++i)
+            rc |= processVoiceFile (argv[i], argv[2]);
+        return rc;
+    }
+
     const std::string outDir = argc > 1 ? argv[1] : ".";
     const double sr = 48000.0;
     int failures = 0;
@@ -263,6 +413,8 @@ int main (int argc, char** argv)
         { "quantize_+3", Mode::Quantize, 3.0f, 0.0f, false, 226.0, 220.0 * std::pow (2.0, 3.0 / 12.0), 1.0 },
         { "robot", Mode::Robot, 0.0f, 0.0f, false, 170.0, 523.2511, 1.0 },
         { "robot_-12", Mode::Robot, -12.0f, 0.0f, false, 170.0, 261.6256, 1.0 },
+        { "low_voice_+5", Mode::Transpose, 5.0f, 0.0f, false, 90.0, 90.0 * std::pow (2.0, 5.0 / 12.0), 1.0 },
+        { "bass_voice_+3", Mode::Transpose, 3.0f, 0.0f, false, 82.0, 82.0 * std::pow (2.0, 3.0 / 12.0), 1.0 },
     };
 
     for (const auto& c : cases)

@@ -130,6 +130,24 @@ public:
             }
         }
 
+        // Sub-multiple check: if a period of best/2 or best/3 is almost as periodic,
+        // the dip at best is a subharmonic (octave-down error).
+        for (int k = 3; k >= 2; --k)
+        {
+            const int centre = (int) std::lround ((double) best / k);
+            if (centre - 2 < minLag)
+                continue;
+            int local = centre;
+            for (int tau = centre - 2; tau <= centre + 2; ++tau)
+                if (d[(size_t) tau] < d[(size_t) local])
+                    local = tau;
+            if (d[(size_t) local] < 2.0f * kThreshold && d[(size_t) local] <= d[(size_t) best] + 0.08f)
+            {
+                best = local;
+                break;
+            }
+        }
+
         aperiodicity = d[(size_t) best];
 
         // Parabolic interpolation around the dip.
@@ -229,6 +247,7 @@ public:
         hopCount = 0;
         yinPending = false;
         yinPendingCentre = 0;
+        lastPeriod = candidatePeriod = 0.0f;
 
         estimates.assign (kEstCap, Estimate {});
         estHead = 0;
@@ -412,9 +431,35 @@ private:
             period = std::max (std::min (a, b), std::min (std::max (a, b), c));
         }
 
+        bool voiced = period > 0.0f && period <= (float) tMax;
+
+        // Jumps of more than 7 semitones (or hesitant onsets) must be confirmed by the
+        // next analysis; until then the previous state is held. Kills one-hop octave
+        // and harmonic errors at consonant/vowel boundaries for ~5 ms of extra lag.
+        auto semis = [] (float a, float b) { return std::abs (12.0f * std::log2 (a / b)); };
+        if (voiced)
+        {
+            const bool confirmsPending = candidatePeriod > 0.0f && semis (period, candidatePeriod) < 1.0f;
+            if (lastPeriod > 0.0f && semis (period, lastPeriod) > 7.0f && !confirmsPending)
+            {
+                candidatePeriod = period;
+                period = lastPeriod;
+            }
+            else if (lastPeriod <= 0.0f && aperiodicity > kConfidentOnset && !confirmsPending)
+            {
+                candidatePeriod = period;
+                voiced = false;
+            }
+            else
+                candidatePeriod = 0.0f;
+        }
+        else
+            candidatePeriod = 0.0f;
+        lastPeriod = voiced ? period : 0.0f;
+
         Estimate e;
         e.centre = yinPendingCentre;
-        e.voiced = period > 0.0f && period <= (float) tMax;
+        e.voiced = voiced;
         e.period = e.voiced ? period : 0.0f;
         lastDetectedHz = e.voiced ? (float) (sr / period) : 0.0f;
 
@@ -621,6 +666,8 @@ private:
             // analysis epochs so wet and dry stay phase-coherent (no comb when mixing).
             const double align = std::clamp (1.0 - std::abs (target - midiIn) / 0.15, 0.0, 1.0);
             voicedMakeup = 1.0 + 0.2 * std::min (1.0, (double) std::abs (target - midiIn));
+            if (ratio > 1.0f)
+                voicedMakeup *= std::pow ((double) ratio, -0.3); // denser pulses already add loudness
             hop -= align * 0.5 * (nextSyn - a.pos);
             readRate = link ? ratio : formantRatio;
             // Two source periods around the epoch: neighbouring pulses fall on
@@ -685,6 +732,8 @@ private:
     YinDetector yin;
     int yinLen = 0, yinHop = 256, yinTausPerSample = 4;
     bool yinPending = false;
+    float lastPeriod = 0.0f, candidatePeriod = 0.0f;
+    static constexpr float kConfidentOnset = 0.1f;
     int64_t yinPendingCentre = 0;
 
     int numCh = 1;
