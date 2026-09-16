@@ -272,6 +272,7 @@ void TxikiAlterboyProcessor::setCurrentProgram (int index)
     if (!juce::isPositiveAndBelow (index, numFactoryPresets))
         return;
     currentProgram = index;
+    currentUserPreset = {};
     const auto& p = factoryPresets[index];
     auto set = [this] (const char* id, float value)
     {
@@ -290,6 +291,7 @@ void TxikiAlterboyProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     state.setProperty ("program", currentProgram, nullptr);
+    state.setProperty ("userPreset", currentUserPreset, nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -301,6 +303,7 @@ void TxikiAlterboyProcessor::setStateInformation (const void* data, int sizeInBy
         {
             auto tree = juce::ValueTree::fromXml (*xml);
             currentProgram = tree.getProperty ("program", 0);
+            currentUserPreset = tree.getProperty ("userPreset", juce::String()).toString();
             apvts.replaceState (tree);
 
             // replaceState skips parameters whose denormalised value looks unchanged, which
@@ -310,6 +313,68 @@ void TxikiAlterboyProcessor::setStateInformation (const void* data, int sizeInBy
                     if (auto* stored = apvts.getRawParameterValue (ranged->getParameterID()))
                         ranged->setValueNotifyingHost (ranged->convertTo0to1 (stored->load()));
         }
+}
+
+juce::File TxikiAlterboyProcessor::getUserPresetFolder()
+{
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("TxikiAlterboy").getChildFile ("Presets");
+}
+
+juce::StringArray TxikiAlterboyProcessor::getUserPresetNames() const
+{
+    juce::StringArray names;
+    for (const auto& f : getUserPresetFolder().findChildFiles (juce::File::findFiles, false, "*.txpreset"))
+        names.add (f.getFileNameWithoutExtension());
+    names.sortNatural();
+    return names;
+}
+
+bool TxikiAlterboyProcessor::saveUserPreset (const juce::String& name)
+{
+    const auto legal = juce::File::createLegalFileName (name.trim());
+    if (legal.isEmpty())
+        return false;
+    auto folder = getUserPresetFolder();
+    if (!folder.createDirectory())
+        return false;
+
+    juce::XmlElement xml ("TxikiPreset");
+    for (auto* p : getParameters())
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p))
+            if (ranged->getParameterID() != ParamIDs::bypass)
+            {
+                auto* e = xml.createNewChildElement ("PARAM");
+                e->setAttribute ("id", ranged->getParameterID());
+                e->setAttribute ("value", ranged->convertFrom0to1 (ranged->getValue()));
+            }
+    if (!xml.writeTo (folder.getChildFile (legal + ".txpreset")))
+        return false;
+    currentUserPreset = legal;
+    return true;
+}
+
+bool TxikiAlterboyProcessor::loadUserPreset (const juce::String& name)
+{
+    auto xml = juce::XmlDocument::parse (getUserPresetFolder().getChildFile (name + ".txpreset"));
+    if (xml == nullptr || !xml->hasTagName ("TxikiPreset"))
+        return false;
+    for (auto* e : xml->getChildWithTagNameIterator ("PARAM"))
+        if (auto* param = apvts.getParameter (e->getStringAttribute ("id")))
+        {
+            param->beginChangeGesture();
+            param->setValueNotifyingHost (param->convertTo0to1 ((float) e->getDoubleAttribute ("value")));
+            param->endChangeGesture();
+        }
+    currentUserPreset = name;
+    return true;
+}
+
+bool TxikiAlterboyProcessor::deleteUserPreset (const juce::String& name)
+{
+    const bool ok = getUserPresetFolder().getChildFile (name + ".txpreset").deleteFile();
+    if (ok && currentUserPreset == name)
+        currentUserPreset = {};
+    return ok;
 }
 
 juce::AudioProcessorEditor* TxikiAlterboyProcessor::createEditor() { return new TxikiAlterboyEditor (*this); }

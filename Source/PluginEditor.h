@@ -28,6 +28,13 @@ public:
         }
     }
     void paint (juce::Graphics&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override
+    {
+        if (onDoubleClick)
+            onDoubleClick();
+    }
+
+    std::function<void()> onDoubleClick;
 
 private:
     juce::String text;
@@ -46,19 +53,30 @@ public:
     }
 };
 
-class TxikiAlterboyEditor : public juce::AudioProcessorEditor, private juce::Timer
+// Fixed 800x340 logical layout; the editor scales it as a whole.
+class AlterPanel : public juce::Component, private juce::Timer
 {
 public:
-    explicit TxikiAlterboyEditor (TxikiAlterboyProcessor&);
-    ~TxikiAlterboyEditor() override;
+    static constexpr int kWidth = 800;
+    static constexpr int kHeight = 340;
+
+    explicit AlterPanel (TxikiAlterboyProcessor&);
+    ~AlterPanel() override;
 
     void paint (juce::Graphics&) override;
     void resized() override;
 
 private:
     void timerCallback() override;
-    void refreshPresetBox();
     void setupKnob (juce::Slider& s);
+    void setupValueLabel (juce::Label& l, const char* paramId);
+    void rebuildPresetBox();
+    void refreshPresetBox();
+    void savePresetDialog();
+    void deletePresetDialog();
+    void editValue (juce::Component& over, const char* paramId);
+    void setParam (const char* paramId, float plainValue);
+    void stepPreset (int delta);
 
     TxikiAlterboyProcessor& proc;
     AlterLookAndFeel lnf;
@@ -68,9 +86,12 @@ private:
     juce::ToggleButton linkButton, midiButton;
     juce::ToggleButton modeButtons[3];
     LedReadout pitchLed, formantLed, noteLed { false };
+    juce::Label driveValue, mixValue;
 
-    juce::TextButton prevButton { "<" }, nextButton { ">" };
+    juce::TextButton prevButton { "<" }, nextButton { ">" }, saveButton { "SAVE" }, deleteButton { "DEL" };
     juce::ComboBox presetBox;
+    std::unique_ptr<juce::TextEditor> valueEditor;
+    juce::StringArray userPresetNames;
 
     using SliderAtt = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ButtonAtt = juce::AudioProcessorValueTreeState::ButtonAttachment;
@@ -79,8 +100,21 @@ private:
 
     juce::Rectangle<int> goldPanel, bluePanel, redPanel, bodyArea, footer;
     juce::Image woodTexture;
-    double lastDrive = -1.0, lastMix = -1.0;
     int lastMode = -1;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AlterPanel)
+};
+
+class TxikiAlterboyEditor : public juce::AudioProcessorEditor
+{
+public:
+    explicit TxikiAlterboyEditor (TxikiAlterboyProcessor&);
+    void resized() override;
+
+private:
+    TxikiAlterboyProcessor& proc;
+    AlterPanel panel;
+    bool sizeInitialised = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TxikiAlterboyEditor)
 };

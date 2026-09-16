@@ -46,3 +46,19 @@ target_link_libraries(TxikiAlterboy
         juce::juce_recommended_warning_flags)
 
 add_executable(OfflineTest tests/OfflineTest.cpp)
+
+# Processor-level tests (presets, state) built as a JUCE console app.
+juce_add_console_app(ProcessorTest PRODUCT_NAME "ProcessorTest")
+target_sources(ProcessorTest PRIVATE
+    tests/ProcessorTest.cpp
+    Source/PluginProcessor.cpp
+    Source/PluginEditor.cpp)
+target_include_directories(ProcessorTest PRIVATE Source)
+target_compile_definitions(ProcessorTest PRIVATE
+    JucePlugin_Name="Txiki AlterBoy"
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0)
+target_link_libraries(ProcessorTest PRIVATE
+    juce::juce_audio_utils
+    juce::juce_dsp
+    juce::juce_recommended_config_flags)

@@ -11,9 +11,6 @@ const juce::Colour kRedDark { 0xff85121a };
 const juce::Colour kBody { 0xff1c1f24 };
 const juce::Colour kLedRed { 0xffff2a1a };
 
-constexpr int kWidth = 800;
-constexpr int kHeight = 340;
-
 juce::String noteName (float hz)
 {
     if (hz <= 0.0f)
@@ -196,18 +193,23 @@ void LedReadout::paint (juce::Graphics& g)
     g.drawText (text, r.reduced (6.0f, 0.0f), juce::Justification::centredRight);
 }
 
-// ============================================================ Editor
-TxikiAlterboyEditor::TxikiAlterboyEditor (TxikiAlterboyProcessor& p)
-    : AudioProcessorEditor (&p), proc (p)
+// ============================================================ Panel
+namespace
+{
+constexpr int kUserPresetIdBase = 1000;
+}
+
+AlterPanel::AlterPanel (TxikiAlterboyProcessor& p) : proc (p)
 {
     setLookAndFeel (&lnf);
 
     for (juce::Slider* k : { static_cast<juce::Slider*> (&pitchKnob), static_cast<juce::Slider*> (&formantKnob), &driveKnob, &mixKnob })
         setupKnob (*k);
 
-    pitchKnob.setTooltip ("Semitone steps. Hold Shift for fine adjustment.");
+    const juce::String semitoneTip ("Semitone steps. Hold Shift for fine adjustment. Double-click the display to type a value.");
+    pitchKnob.setTooltip (semitoneTip);
     pitchAtt = std::make_unique<SliderAtt> (proc.apvts, ParamIDs::pitch, pitchKnob);
-    formantKnob.setTooltip ("Semitone steps. Hold Shift for fine adjustment.");
+    formantKnob.setTooltip (semitoneTip);
     formantAtt = std::make_unique<SliderAtt> (proc.apvts, ParamIDs::formant, formantKnob);
     driveAtt = std::make_unique<SliderAtt> (proc.apvts, ParamIDs::drive, driveKnob);
     mixAtt = std::make_unique<SliderAtt> (proc.apvts, ParamIDs::mix, mixKnob);
@@ -227,59 +229,58 @@ TxikiAlterboyEditor::TxikiAlterboyEditor (TxikiAlterboyProcessor& p)
         auto& b = modeButtons[i];
         b.setButtonText (modeNames[i]);
         b.setClickingTogglesState (false);
-        b.onClick = [this, i]
-        {
-            if (auto* param = proc.apvts.getParameter (ParamIDs::mode))
-            {
-                param->beginChangeGesture();
-                param->setValueNotifyingHost (param->convertTo0to1 ((float) i));
-                param->endChangeGesture();
-            }
-        };
+        b.onClick = [this, i] { setParam (ParamIDs::mode, (float) i); };
         addAndMakeVisible (b);
     }
 
     for (auto* led : { &pitchLed, &formantLed, &noteLed })
         addAndMakeVisible (led);
+    pitchLed.onDoubleClick = [this] { editValue (pitchLed, ParamIDs::pitch); };
+    formantLed.onDoubleClick = [this] { editValue (formantLed, ParamIDs::formant); };
 
-    for (int i = 0; i < proc.getNumPrograms(); ++i)
-        presetBox.addItem (proc.getProgramName (i), i + 1);
+    setupValueLabel (driveValue, ParamIDs::drive);
+    setupValueLabel (mixValue, ParamIDs::mix);
+
     presetBox.onChange = [this]
     {
-        const int idx = presetBox.getSelectedId() - 1;
-        if (idx >= 0 && idx != proc.getCurrentProgram())
-            proc.setCurrentProgram (idx);
+        const int id = presetBox.getSelectedId();
+        if (id >= kUserPresetIdBase)
+        {
+            const auto name = userPresetNames[id - kUserPresetIdBase];
+            if (name != proc.getCurrentUserPreset())
+                proc.loadUserPreset (name);
+        }
+        else if (id > 0 && (id - 1 != proc.getCurrentProgram() || proc.getCurrentUserPreset().isNotEmpty()))
+        {
+            proc.setCurrentProgram (id - 1);
+        }
+        refreshPresetBox();
     };
     addAndMakeVisible (presetBox);
 
-    prevButton.onClick = [this]
-    {
-        const int n = proc.getNumPrograms();
-        proc.setCurrentProgram ((proc.getCurrentProgram() + n - 1) % n);
-        refreshPresetBox();
-    };
-    nextButton.onClick = [this]
-    {
-        proc.setCurrentProgram ((proc.getCurrentProgram() + 1) % proc.getNumPrograms());
-        refreshPresetBox();
-    };
-    addAndMakeVisible (prevButton);
-    addAndMakeVisible (nextButton);
+    prevButton.onClick = [this] { stepPreset (-1); };
+    nextButton.onClick = [this] { stepPreset (1); };
+    saveButton.setTooltip ("Save the current settings as a user preset");
+    saveButton.onClick = [this] { savePresetDialog(); };
+    deleteButton.setTooltip ("Delete the selected user preset");
+    deleteButton.onClick = [this] { deletePresetDialog(); };
+    for (auto* b : { &prevButton, &nextButton, &saveButton, &deleteButton })
+        addAndMakeVisible (b);
 
-    woodTexture = makeWood (26, kHeight);
-    refreshPresetBox();
+    woodTexture = makeWood (26, AlterPanel::kHeight);
+    rebuildPresetBox();
     setSize (kWidth, kHeight);
     timerCallback();
     startTimerHz (30);
 }
 
-TxikiAlterboyEditor::~TxikiAlterboyEditor()
+AlterPanel::~AlterPanel()
 {
     stopTimer();
     setLookAndFeel (nullptr);
 }
 
-void TxikiAlterboyEditor::setupKnob (juce::Slider& s)
+void AlterPanel::setupKnob (juce::Slider& s)
 {
     s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
     s.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
@@ -290,12 +291,181 @@ void TxikiAlterboyEditor::setupKnob (juce::Slider& s)
     addAndMakeVisible (s);
 }
 
-void TxikiAlterboyEditor::refreshPresetBox()
+void AlterPanel::setupValueLabel (juce::Label& l, const char* paramId)
 {
-    presetBox.setSelectedId (proc.getCurrentProgram() + 1, juce::dontSendNotification);
+    l.setJustificationType (juce::Justification::centred);
+    l.setFont (juce::FontOptions (11.0f));
+    l.setColour (juce::Label::textColourId, juce::Colours::white.withAlpha (0.6f));
+    l.setColour (juce::Label::textWhenEditingColourId, juce::Colours::white);
+    l.setColour (juce::Label::backgroundWhenEditingColourId, juce::Colour (0xff120606));
+    l.setColour (juce::Label::outlineWhenEditingColourId, kLedRed);
+    l.setTooltip ("Double-click to type a value (0-100)");
+    l.setEditable (false, true, false);
+    l.onEditorShow = [&l]
+    {
+        if (auto* ed = l.getCurrentTextEditor())
+        {
+            ed->setInputRestrictions (5, "0123456789.,");
+            ed->setText (l.getText().upToFirstOccurrenceOf ("%", false, false), false);
+            ed->selectAll();
+        }
+    };
+    l.onTextChange = [this, &l, paramId]
+    {
+        const auto text = l.getText().upToFirstOccurrenceOf ("%", false, false).replaceCharacter (',', '.').trim();
+        if (text.isNotEmpty())
+            setParam (paramId, juce::jlimit (0.0f, 1.0f, text.getFloatValue() / 100.0f));
+    };
+    addAndMakeVisible (l);
 }
 
-void TxikiAlterboyEditor::timerCallback()
+void AlterPanel::setParam (const char* paramId, float plainValue)
+{
+    if (auto* param = proc.apvts.getParameter (paramId))
+    {
+        param->beginChangeGesture();
+        param->setValueNotifyingHost (param->convertTo0to1 (plainValue));
+        param->endChangeGesture();
+    }
+}
+
+// ------------------------------------------------------------------ presets
+void AlterPanel::rebuildPresetBox()
+{
+    presetBox.clear (juce::dontSendNotification);
+    presetBox.addSectionHeading ("Factory");
+    for (int i = 0; i < proc.getNumPrograms(); ++i)
+        presetBox.addItem (proc.getProgramName (i), i + 1);
+
+    userPresetNames = proc.getUserPresetNames();
+    if (!userPresetNames.isEmpty())
+    {
+        presetBox.addSeparator();
+        presetBox.addSectionHeading ("User");
+        for (int i = 0; i < userPresetNames.size(); ++i)
+            presetBox.addItem (userPresetNames[i], kUserPresetIdBase + i);
+    }
+    refreshPresetBox();
+}
+
+void AlterPanel::refreshPresetBox()
+{
+    const auto user = proc.getCurrentUserPreset();
+    const int userIndex = userPresetNames.indexOf (user);
+    const bool userActive = user.isNotEmpty() && userIndex >= 0;
+    const int id = userActive ? kUserPresetIdBase + userIndex : proc.getCurrentProgram() + 1;
+    if (presetBox.getSelectedId() != id)
+        presetBox.setSelectedId (id, juce::dontSendNotification);
+    deleteButton.setEnabled (userActive);
+}
+
+void AlterPanel::stepPreset (int delta)
+{
+    // Factory presets followed by user presets, as one list.
+    const int numFactory = proc.getNumPrograms();
+    const int total = numFactory + userPresetNames.size();
+    const int userIndex = userPresetNames.indexOf (proc.getCurrentUserPreset());
+    const int current = proc.getCurrentUserPreset().isNotEmpty() && userIndex >= 0 ? numFactory + userIndex : proc.getCurrentProgram();
+    const int next = (current + delta + total) % total;
+    if (next < numFactory)
+        proc.setCurrentProgram (next);
+    else
+        proc.loadUserPreset (userPresetNames[next - numFactory]);
+    refreshPresetBox();
+}
+
+void AlterPanel::savePresetDialog()
+{
+    auto* w = new juce::AlertWindow ("Save preset", "Preset name:", juce::MessageBoxIconType::NoIcon, this);
+    w->addTextEditor ("name", proc.getCurrentUserPreset().isNotEmpty() ? proc.getCurrentUserPreset() : juce::String ("My preset"));
+    w->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<AlterPanel> safe (this);
+    w->enterModalState (true,
+                        juce::ModalCallbackFunction::create ([safe, w] (int result)
+                                                             {
+                                                                 if (result != 1 || safe == nullptr)
+                                                                     return;
+                                                                 if (safe->proc.saveUserPreset (w->getTextEditorContents ("name")))
+                                                                     safe->rebuildPresetBox();
+                                                             }),
+                        true);
+}
+
+void AlterPanel::deletePresetDialog()
+{
+    const auto name = proc.getCurrentUserPreset();
+    if (name.isEmpty())
+        return;
+    juce::Component::SafePointer<AlterPanel> safe (this);
+    juce::AlertWindow::showAsync (juce::MessageBoxOptions()
+                                      .withIconType (juce::MessageBoxIconType::QuestionIcon)
+                                      .withTitle ("Delete preset")
+                                      .withMessage ("Delete user preset \"" + name + "\"?")
+                                      .withButton ("Delete")
+                                      .withButton ("Cancel")
+                                      .withAssociatedComponent (this),
+                                  [safe, name] (int result)
+                                  {
+                                      if (result == 1 && safe != nullptr && safe->proc.deleteUserPreset (name))
+                                          safe->rebuildPresetBox();
+                                  });
+}
+
+// ------------------------------------------------------------ typed values
+void AlterPanel::editValue (juce::Component& over, const char* paramId)
+{
+    auto* param = proc.apvts.getParameter (paramId);
+    if (param == nullptr)
+        return;
+
+    valueEditor = std::make_unique<juce::TextEditor>();
+    auto& ed = *valueEditor;
+    ed.setJustification (juce::Justification::centred);
+    ed.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 16.0f, juce::Font::bold));
+    ed.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff120606));
+    ed.setColour (juce::TextEditor::textColourId, kLedRed);
+    ed.setColour (juce::TextEditor::outlineColourId, kLedRed);
+    ed.setColour (juce::TextEditor::focusedOutlineColourId, kLedRed);
+    ed.setInputRestrictions (6, "-+0123456789.,");
+    ed.setText (juce::String (param->convertFrom0to1 (param->getValue()), 1), false);
+    ed.selectAll();
+    ed.setBounds (over.getBounds().expanded (2, 1));
+    addAndMakeVisible (ed);
+    ed.grabKeyboardFocus();
+
+    auto close = [safe = juce::Component::SafePointer<AlterPanel> (this)]
+    {
+        juce::MessageManager::callAsync ([safe]
+                                         {
+                                             if (safe != nullptr)
+                                                 safe->valueEditor.reset();
+                                         });
+    };
+    auto commit = [this, param, paramId, close]
+    {
+        if (valueEditor == nullptr || !valueEditor->isVisible())
+            return;
+        const auto text = valueEditor->getText().replaceCharacter (',', '.').trim();
+        valueEditor->setVisible (false);
+        if (text.isNotEmpty() && text != "-")
+        {
+            const auto range = param->getNormalisableRange();
+            setParam (paramId, juce::jlimit (range.start, range.end, text.getFloatValue()));
+        }
+        close();
+    };
+    ed.onReturnKey = commit;
+    ed.onFocusLost = commit;
+    ed.onEscapeKey = [this, close]
+    {
+        if (valueEditor != nullptr)
+            valueEditor->setVisible (false);
+        close();
+    };
+}
+
+void AlterPanel::timerCallback()
 {
     const int mode = (int) proc.apvts.getRawParameterValue (ParamIDs::mode)->load();
     for (int i = 0; i < 3; ++i)
@@ -315,18 +485,21 @@ void TxikiAlterboyEditor::timerCallback()
     else
         noteLed.setText (noteName (proc.detectedHz.load()));
 
+    if (!driveValue.isBeingEdited())
+        driveValue.setText (juce::String (juce::roundToInt (driveKnob.getValue() * 100.0)) + "%", juce::dontSendNotification);
+    if (!mixValue.isBeingEdited())
+        mixValue.setText (juce::String (juce::roundToInt (mixKnob.getValue() * 100.0)) + "%", juce::dontSendNotification);
+
     refreshPresetBox();
 
-    if (driveKnob.getValue() != lastDrive || mixKnob.getValue() != lastMix || mode != lastMode)
+    if (mode != lastMode)
     {
-        lastDrive = driveKnob.getValue();
-        lastMix = mixKnob.getValue();
         lastMode = mode;
         repaint();
     }
 }
 
-void TxikiAlterboyEditor::resized()
+void AlterPanel::resized()
 {
     auto area = getLocalBounds();
     auto topBar = area.removeFromTop (40).reduced (30, 7);
@@ -335,6 +508,10 @@ void TxikiAlterboyEditor::resized()
     nextButton.setBounds (topBar.removeFromLeft (26));
     topBar.removeFromLeft (8);
     presetBox.setBounds (topBar.removeFromLeft (260));
+    topBar.removeFromLeft (8);
+    saveButton.setBounds (topBar.removeFromLeft (50));
+    topBar.removeFromLeft (4);
+    deleteButton.setBounds (topBar.removeFromLeft (42));
 
     bodyArea = area.reduced (26, 0);
     auto inner = bodyArea.reduced (16, 14);
@@ -366,12 +543,14 @@ void TxikiAlterboyEditor::resized()
     auto mixCol = rp;
     driveKnob.setBounds (driveCol.getCentreX() - knob / 2, redPanel.getY() + 38, knob, knob);
     mixKnob.setBounds (mixCol.getCentreX() - knob / 2, redPanel.getY() + 38, knob, knob);
+    driveValue.setBounds (driveKnob.getX() + 14, driveKnob.getBottom() + 20, driveKnob.getWidth() - 28, 18);
+    mixValue.setBounds (mixKnob.getX() + 14, mixKnob.getBottom() + 20, mixKnob.getWidth() - 28, 18);
 
     noteLed.setBounds (footer.getRight() - 236, footer.getCentreY() - 12, 74, 24);
     midiButton.setBounds (footer.getRight() - 140, footer.getCentreY() - 11, 70, 22);
 }
 
-void TxikiAlterboyEditor::paint (juce::Graphics& g)
+void AlterPanel::paint (juce::Graphics& g)
 {
     // Top bar.
     g.setGradientFill (juce::ColourGradient (juce::Colour (0xff3a3c40), 0, 0, juce::Colour (0xff1c1d20), 0, 40, false));
@@ -444,12 +623,6 @@ void TxikiAlterboyEditor::paint (juce::Graphics& g)
     label ("DRY", { mixKnob.getX() - 12, mixKnob.getBottom() + 2, 40, 14 }, 10.0f);
     label ("WET", { mixKnob.getRight() - 28, mixKnob.getBottom() + 2, 40, 14 }, 10.0f);
 
-    // Drive / mix value hints.
-    g.setFont (juce::FontOptions (11.0f));
-    g.setColour (juce::Colours::white.withAlpha (0.6f));
-    g.drawText (juce::String (juce::roundToInt (driveKnob.getValue() * 100.0)) + "%", driveKnob.getX(), driveKnob.getBottom() + 22, driveKnob.getWidth(), 14, juce::Justification::centred);
-    g.drawText (juce::String (juce::roundToInt (mixKnob.getValue() * 100.0)) + "%", mixKnob.getX(), mixKnob.getBottom() + 22, mixKnob.getWidth(), 14, juce::Justification::centred);
-
     // Footer branding.
     auto f = footer;
     g.setFont (juce::FontOptions (26.0f, juce::Font::bold));
@@ -462,4 +635,29 @@ void TxikiAlterboyEditor::paint (juce::Graphics& g)
     g.drawText ("monophonic voice manipulation", f.getX() + 186, f.getY() + 3, 220, f.getHeight(), juce::Justification::centredLeft);
     g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
     g.drawText (juce::String (modeButtons[2].getToggleState() ? "ROBOT NOTE" : "INPUT NOTE"), noteLed.getX() - 80, noteLed.getY(), 76, noteLed.getHeight(), juce::Justification::centredRight);
+}
+
+// ============================================================ Editor (scales the panel)
+TxikiAlterboyEditor::TxikiAlterboyEditor (TxikiAlterboyProcessor& p)
+    : AudioProcessorEditor (&p), proc (p), panel (p)
+{
+    // Read the stored scale first: setResizeLimits() constrains the still-empty editor
+    // to the minimum size, which must not overwrite the user's choice.
+    const float scale = juce::jlimit (0.75f, 2.0f, proc.getUiScale());
+    addAndMakeVisible (panel);
+    setResizable (true, true);
+    setResizeLimits (AlterPanel::kWidth * 3 / 4, AlterPanel::kHeight * 3 / 4, AlterPanel::kWidth * 2, AlterPanel::kHeight * 2);
+    if (auto* aspect = getConstrainer())
+        aspect->setFixedAspectRatio ((double) AlterPanel::kWidth / AlterPanel::kHeight);
+    setSize (juce::roundToInt (AlterPanel::kWidth * scale), juce::roundToInt (AlterPanel::kHeight * scale));
+    sizeInitialised = true;
+}
+
+void TxikiAlterboyEditor::resized()
+{
+    const float scale = (float) getWidth() / (float) AlterPanel::kWidth;
+    panel.setBounds (0, 0, AlterPanel::kWidth, AlterPanel::kHeight);
+    panel.setTransform (juce::AffineTransform::scale (scale));
+    if (sizeInitialised)
+        proc.setUiScale (scale);
 }

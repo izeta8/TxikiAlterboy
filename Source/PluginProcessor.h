@@ -45,6 +45,18 @@ public:
     const juce::String getProgramName (int index) override;
     void changeProgramName (int, const juce::String&) override {}
 
+    // User presets: XML files in %APPDATA%/TxikiAlterboy/Presets.
+    static juce::File getUserPresetFolder();
+    juce::StringArray getUserPresetNames() const;
+    bool saveUserPreset (const juce::String& name);
+    bool loadUserPreset (const juce::String& name);
+    bool deleteUserPreset (const juce::String& name);
+    juce::String getCurrentUserPreset() const { return currentUserPreset; }
+
+    // Editor size (1.0 = 800x340), stored with the plugin state.
+    float getUiScale() const { return (float) apvts.state.getProperty ("uiScale", 1.0f); }
+    void setUiScale (float s) { apvts.state.setProperty ("uiScale", s, nullptr); }
+
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
@@ -75,6 +87,7 @@ private:
 
     std::vector<int> heldNotes;
     int currentProgram = 0;
+    juce::String currentUserPreset;
 
     std::atomic<float>* pPitch = nullptr;
     std::atomic<float>* pFormant = nullptr;
