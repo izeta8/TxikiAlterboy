@@ -37,6 +37,7 @@ public:
 
     int getRequiredLength() const { return window + maxLag + 1; }
     int getMaxLag() const { return maxLag; }
+    int getWindow() const { return window; }
 
     // One-shot analysis (offline use). x points at getRequiredLength() samples.
     float analyse (const float* x, float& aperiodicity)
@@ -186,7 +187,11 @@ public:
         numCh = std::max (1, channels);
         decim = std::max (1, (int) std::floor (sr / 44100.0 + 0.01));
         tMax = (int) std::ceil (sr / kMinF0);
-        latency = (int) std::ceil (4.25 * tMax) + 8;
+        // Latency budget (see placeGrain/generateMarks):
+        //  grains are placed kLookahead*tMax ahead of the output, the nearest epoch can sit
+        //  half a period later, and a grain reads at most tMax of source around it.
+        markLag = (int) std::ceil (0.25 * tMax) + 4;
+        latency = (int) std::ceil ((kLookahead + 1.5) * tMax) + std::max (0, markLag - (int) (0.5 * tMax)) + 8;
         uvHop = sr * 0.005;
         fadeCoeff = (float) (1.0 - std::exp (-1.0 / (0.02 * sr)));
 
@@ -246,14 +251,13 @@ public:
         decFilled = 0;
         hopCount = 0;
         yinPending = false;
-        yinPendingCentre = 0;
+        yinPendingFrameStart = 0;
         lastPeriod = candidatePeriod = 0.0f;
 
         estimates.assign (kEstCap, Estimate {});
         estHead = 0;
         estCount = 0;
         estCursor = 0;
-        periodHistory[0] = periodHistory[1] = periodHistory[2] = 0.0f;
 
         marks.assign (kMarkCap, Mark {});
         markHead = 0;
@@ -286,6 +290,7 @@ public:
     struct Stats
     {
         uint64_t grains = 0, grainSamples = 0, yinBegins = 0, yinCatchUps = 0, marks = 0;
+        uint64_t futureReads = 0, lateGrains = 0; // must stay 0: latency budget violations
     };
     const Stats& getStats() const { return stats; }
 
@@ -322,7 +327,7 @@ public:
         generateMarks();
 
         const int64_t outPos = inPos - 1 - latency; // output(n) = input(n - latency) when neutral
-        while (nextSyn <= (double) (outPos + 2 * tMax))
+        while (nextSyn <= (double) outPos + kLookahead * tMax)
             placeGrain();
 
         // Neutral settings: crossfade to the (latency-aligned) input so the
@@ -412,7 +417,7 @@ private:
         }
         ++stats.yinBegins;
         yin.begin (&decBuf[(size_t) decWrite]);
-        yinPendingCentre = inPos - (int64_t) (yinLen * decim / 2);
+        yinPendingFrameStart = inPos - (int64_t) (yinLen * decim);
         yinPending = true;
     }
 
@@ -420,16 +425,6 @@ private:
     {
         float aperiodicity = 1.0f;
         float period = yin.result (aperiodicity) * (float) decim;
-
-        // Median of three kills isolated octave jumps.
-        periodHistory[0] = periodHistory[1];
-        periodHistory[1] = periodHistory[2];
-        periodHistory[2] = period;
-        if (periodHistory[0] > 0.0f && periodHistory[1] > 0.0f && period > 0.0f)
-        {
-            float a = periodHistory[0], b = periodHistory[1], c = period;
-            period = std::max (std::min (a, b), std::min (std::max (a, b), c));
-        }
 
         bool voiced = period > 0.0f && period <= (float) tMax;
 
@@ -458,7 +453,10 @@ private:
         lastPeriod = voiced ? period : 0.0f;
 
         Estimate e;
-        e.centre = yinPendingCentre;
+        // For a period T, YIN compares samples [0, W + T) of the frame: that span's
+        // centre is the time the estimate really describes.
+        const double usedSpan = (double) yin.getWindow() * decim + (voiced ? (double) period : (double) tMax);
+        e.centre = yinPendingFrameStart + (int64_t) std::llround (0.5 * usedSpan);
         e.voiced = voiced;
         e.period = e.voiced ? period : 0.0f;
         lastDetectedHz = e.voiced ? (float) (sr / period) : 0.0f;
@@ -473,7 +471,9 @@ private:
         }
     }
 
-    Estimate estimateAt (int64_t t)
+    // Pitch at time t: linear interpolation (in log-period) between the two estimates
+    // whose centres bracket t, so glides are followed without hop-sized steps.
+    Estimate estimateAt (double t)
     {
         if (estCount == 0)
             return {};
@@ -481,10 +481,34 @@ private:
         if (estCursor >= estCount)
             estCursor = estCount - 1;
         auto get = [this] (int i) -> const Estimate& { return estimates[(size_t) ((estHead + i) % kEstCap)]; };
-        while (estCursor + 1 < estCount
-               && std::llabs (get (estCursor + 1).centre - t) <= std::llabs (get (estCursor).centre - t))
+        while (estCursor + 1 < estCount && (double) get (estCursor + 1).centre <= t)
             ++estCursor;
-        return get (estCursor);
+
+        const Estimate& a = get (estCursor);
+        if (estCursor + 1 >= estCount && estCount >= 2 && t > (double) a.centre && a.voiced)
+        {
+            // Beyond the newest analysis: extrapolate the log-period trend (bounded),
+            // otherwise glides lag by the analysis delay.
+            const Estimate& p = get (estCount - 2);
+            if (p.voiced && a.centre > p.centre)
+            {
+                const double slope = (std::log ((double) a.period) - std::log ((double) p.period)) / (double) (a.centre - p.centre);
+                const double maxSlope = std::log (2.0) / (0.1 * sr); // at most one octave per 100 ms
+                const double dt = std::min (t - (double) a.centre, 2.0 * tMax);
+                Estimate e = a;
+                e.period = (float) ((double) a.period * std::exp (std::clamp (slope, -maxSlope, maxSlope) * dt));
+                return e;
+            }
+        }
+        if (estCursor + 1 >= estCount || t <= (double) a.centre)
+            return a;
+        const Estimate& b = get (estCursor + 1);
+        const double frac = (t - (double) a.centre) / (double) std::max<int64_t> (1, b.centre - a.centre);
+        if (!a.voiced || !b.voiced)
+            return frac < 0.5 ? a : b;
+        Estimate e = a;
+        e.period = (float) std::exp (std::log ((double) a.period) + frac * (std::log ((double) b.period) - std::log ((double) a.period)));
+        return e;
     }
 
     // ------------------------------------------------------------ analysis marks
@@ -506,12 +530,12 @@ private:
 
     void generateMarks()
     {
-        const int64_t limit = inPos - tMax; // estimates are valid up to here
+        const int64_t limit = inPos - markLag; // pitch beyond the newest analysis is extrapolated
         for (;;)
         {
             const Mark& last = markAt (markCount - 1);
             int64_t candidate = (int64_t) std::llround (nextMarkPos);
-            const Estimate est = estimateAt (candidate);
+            const Estimate est = estimateAt (nextMarkPos);
 
             if (est.voiced)
             {
@@ -685,8 +709,9 @@ private:
             readCentre = nextSyn; // time-aligned so unshifted noise reconstructs exactly
         }
 
-        halfLen = std::min (halfLen, 2.0 * tMax / std::max (1.0, readRate));
-        halfLen = std::min (halfLen, 2.0 * tMax);
+        // Bounded by the latency budget: at most tMax of source read, tMax of output written.
+        halfLen = std::min (halfLen, (double) tMax / std::max (1.0, readRate));
+        halfLen = std::min (halfLen, kLookahead * tMax);
         halfLen = std::max (halfLen, 2.0);
 
         double gain;
@@ -709,6 +734,13 @@ private:
         const double invHalf = 3.141592653589793 / halfLen;
         ++stats.grains;
         stats.grainSamples += (uint64_t) (last - first + 1);
+        {
+            const double maxSrc = readCentre + halfLen * readRate + 3.0;
+            if (maxSrc > (double) (inPos - 1))
+                ++stats.futureReads;
+            if (first <= inPos - 1 - latency - 1)
+                ++stats.lateGrains;
+        }
 
         for (int64_t n = first; n <= last; ++n)
         {
@@ -726,7 +758,8 @@ private:
     }
 
     double sr = 44100.0;
-    int decim = 1, tMax = 588, latency = 2500, bufSize = 0, mask = 0;
+    static constexpr double kLookahead = 1.0;
+    int decim = 1, tMax = 588, latency = 2500, bufSize = 0, mask = 0, markLag = 150;
     double uvHop = 220.0;
 
     YinDetector yin;
@@ -734,7 +767,7 @@ private:
     bool yinPending = false;
     float lastPeriod = 0.0f, candidatePeriod = 0.0f;
     static constexpr float kConfidentOnset = 0.1f;
-    int64_t yinPendingCentre = 0;
+    int64_t yinPendingFrameStart = 0;
 
     int numCh = 1;
     std::vector<std::vector<float>> inBuf, outBuf;
@@ -748,7 +781,6 @@ private:
 
     std::vector<Estimate> estimates;
     int estHead = 0, estCount = 0, estCursor = 0;
-    float periodHistory[3] {};
     float lastDetectedHz = 0.0f;
 
     std::vector<Mark> marks;

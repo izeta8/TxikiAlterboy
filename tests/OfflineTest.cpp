@@ -542,6 +542,103 @@ int main (int argc, char** argv)
             ++failures;
     }
 
+    // Latency budget: no grain may read unreceived input or start before the output position.
+    {
+        uint64_t future = 0, late = 0, grains = 0;
+        for (double rate : { 44100.0, 48000.0, 96000.0 })
+            for (double f0 : { 76.0, 110.0, 300.0, 900.0 })
+                for (int modeIdx = 0; modeIdx < 3; ++modeIdx)
+                    for (float pitch : { -12.0f, 0.5f, 12.0f })
+                        for (float formant : { -12.0f, 12.0f })
+                            for (bool link : { false, true })
+                            {
+                                auto in = makeVowel (rate, 0.6, f0, 80.0);
+                                uint32_t seed = 7;
+                                for (size_t i = (size_t) (0.3 * rate); i < (size_t) (0.4 * rate); ++i)
+                                {
+                                    seed = seed * 1664525u + 1013904223u;
+                                    in[i] = (float) ((seed >> 8) / 16777216.0 - 0.5) * 0.4f;
+                                }
+                                VoiceShifter vs;
+                                vs.prepare (rate);
+                                vs.setParameters ((Mode) modeIdx, pitch, formant, link);
+                                for (auto v : in)
+                                    vs.processSample (v);
+                                future += vs.getStats().futureReads;
+                                late += vs.getStats().lateGrains;
+                                grains += vs.getStats().grains;
+                            }
+        const bool ok = future == 0 && late == 0;
+        if (!ok)
+            ++failures;
+        std::printf ("latency budget: %llu grains, future reads=%llu, late grains=%llu %s\n", (unsigned long long) grains,
+                     (unsigned long long) future, (unsigned long long) late, ok ? "OK" : "FAIL");
+    }
+
+    // Fast glides: output pitch must follow input pitch (x ratio) within tight limits.
+    {
+        auto makeGlide = [&] (double seconds)
+        {
+            std::vector<float> out ((size_t) (sr * seconds));
+            Resonator f1 (700, 90, sr), f2 (1220, 110, sr), f3 (2600, 170, sr);
+            double phase = 0.0, prev = 0.0;
+            for (size_t i = 0; i < out.size(); ++i)
+            {
+                const double t = (double) i / sr;
+                const double tri = std::abs (std::fmod (t, 0.6) / 0.3 - 1.0); // 1 octave in 300 ms, up and down
+                const double f = 150.0 * std::pow (2.0, 1.0 - tri);
+                phase += f / sr;
+                if (phase >= 1.0)
+                    phase -= 1.0;
+                const double open = 0.6;
+                double g = phase < open ? 0.5 * (1.0 - std::cos (kPi * phase / open)) : std::cos (kPi * (phase - open) / (2.0 * (1.0 - open)));
+                if (phase >= open)
+                    g = std::max (0.0, g);
+                const double dg = g - prev;
+                prev = g;
+                out[i] = (float) (f1.process (dg) + f2.process (dg) * 0.6 + f3.process (dg) * 0.3) * 20.0f;
+            }
+            return out;
+        };
+        const auto glideIn = makeGlide (3.0);
+        VoiceShifter vs;
+        vs.prepare (sr);
+        vs.setParameters (Mode::Transpose, 5.0f, 0.0f, false);
+        const int lat = vs.getLatencySamples();
+        std::vector<float> out (glideIn.size());
+        for (size_t i = 0; i < glideIn.size(); ++i)
+            out[i] = vs.processSample (glideIn[i]);
+
+        YinDetector yin;
+        yin.prepare (sr, 60.0, 1100.0);
+        const int len = yin.getRequiredLength();
+        std::vector<double> errs;
+        double riseErr = 0, fallErr = 0;
+        int riseN = 0, fallN = 0;
+        for (size_t i = (size_t) sr / 2 + lat; i + len < out.size(); i += 256)
+        {
+            float ap = 0;
+            const float pOut = yin.analyse (&out[i], ap);
+            const float pIn = yin.analyse (&glideIn[i - lat], ap);
+            if (pOut > 0 && pIn > 0)
+            {
+                const double signedErr = 1200.0 * std::log2 ((double) pIn / pOut) - 500.0;
+                errs.push_back (std::abs (signedErr));
+                const double tIn = (double) (i - lat) / sr;
+                const bool rising = std::fmod (tIn, 0.6) < 0.3;
+                (rising ? riseErr : fallErr) += signedErr;
+                (rising ? riseN : fallN) += 1;
+            }
+        }
+        std::printf ("glide signed mean error: rising %.1fc falling %.1fc\n", riseErr / std::max (1, riseN), fallErr / std::max (1, fallN));
+        std::sort (errs.begin(), errs.end());
+        const double med = errs[errs.size() / 2], p95 = errs[(size_t) (errs.size() * 0.95)];
+        const bool ok = med < 15.0 && p95 < 60.0;
+        if (!ok)
+            ++failures;
+        std::printf ("glide +5st latency=%d (%.1f ms) tracking error median=%.1fc p95=%.1fc %s\n", lat, 1000.0 * lat / sr, med, p95, ok ? "OK" : "FAIL");
+    }
+
     // Worst-case block cost: 64-sample blocks, stereo, formant up (sinc path) at 48 kHz.
     {
         const auto voice = makeVowel (sr, 6.0, 150.0, 30.0);
