@@ -5,9 +5,13 @@
 
 #include "../Source/dsp/VoiceShifter.h"
 
+#define NOMINMAX
+#include <windows.h>
+
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <numeric>
 #include <string>
 
 using namespace txiki;
@@ -384,6 +388,65 @@ int main (int argc, char** argv)
         std::printf ("neutral sr=%6.0f SNR vs dry = %.1f dB %s\n", rate, snr, snr > 40.0 ? "OK" : "FAIL");
         if (snr <= 40.0)
             ++failures;
+    }
+
+    // Worst-case block cost: 64-sample blocks, stereo, formant up (sinc path) at 48 kHz.
+    {
+        const auto voice = makeVowel (sr, 6.0, 150.0, 30.0);
+        VoiceShifter vs;
+        vs.prepare (sr, 2);
+        vs.setParameters (Mode::Transpose, 7.0f, 5.0f, false);
+        const int block = 64;
+        // Audio threads in a DAW run at elevated priority; do the same here.
+        SetThreadPriority (GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        std::vector<double> times;
+        for (size_t start = 0; start + block <= voice.size(); start += block)
+        {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < block; ++i)
+            {
+                const float in[2] = { voice[start + i], voice[start + i] };
+                float o[2];
+                vs.processFrame (in, o);
+            }
+            const double ms = std::chrono::duration<double, std::milli> (std::chrono::high_resolution_clock::now() - t0).count();
+            times.push_back (ms);
+        }
+        // OS noise floor: a constant synthetic workload with the same mean cost per block.
+        const double meanMs = std::accumulate (times.begin(), times.end(), 0.0) / times.size();
+        int iters = 1000;
+        {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            volatile double acc = 0;
+            for (int i = 0; i < 1000000; ++i)
+                acc = acc + std::sin ((double) i);
+            const double perIter = std::chrono::duration<double, std::milli> (std::chrono::high_resolution_clock::now() - t0).count() / 1000000.0;
+            iters = std::max (1, (int) (meanMs / perIter));
+        }
+        std::vector<double> noise;
+        for (size_t start = 0; start + block <= voice.size(); start += block)
+        {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            volatile double acc = 0;
+            for (int i = 0; i < iters; ++i)
+                acc = acc + std::sin ((double) i);
+            noise.push_back (std::chrono::duration<double, std::milli> (std::chrono::high_resolution_clock::now() - t0).count());
+        }
+        std::sort (noise.begin(), noise.end());
+        std::printf ("reference load p99.9=%.3fms worst=%.3fms\n", noise[(size_t) (noise.size() * 0.999)], noise.back());
+
+        std::sort (times.begin(), times.end());
+        const double budget = 1000.0 * block / sr;
+        const double mean = std::accumulate (times.begin(), times.end(), 0.0) / times.size();
+        const double p999 = times[(size_t) (times.size() * 0.999)];
+        const double worst = times.back();
+        const double noiseP999 = noise[(size_t) (noise.size() * 0.999)];
+        // Algorithmic spikes only: the engine may not be much spikier than an equal constant load.
+        const bool ok = p999 < std::max (0.5 * budget, 2.0 * noiseP999);
+        if (!ok)
+            ++failures;
+        std::printf ("blocks(64) mean=%.3fms p99.9=%.3fms worst=%.3fms budget=%.2fms worst/mean=%.1fx %s\n", mean, p999, worst, budget,
+                     worst / mean, ok ? "OK" : "FAIL");
     }
 
     // Aliasing: bright band-limited vowel shifted up; report inharmonic energy.

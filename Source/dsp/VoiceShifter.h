@@ -32,36 +32,75 @@ public:
         minLag = std::max (2, (int) std::floor (sr / maxHz));
         window = maxLag;
         diff.assign ((size_t) maxLag + 1, 0.0f);
+        frame.assign ((size_t) getRequiredLength(), 0.0f);
     }
 
     int getRequiredLength() const { return window + maxLag + 1; }
+    int getMaxLag() const { return maxLag; }
 
-    // x points at getRequiredLength() contiguous samples.
-    // Returns period in samples (0 if unvoiced).
-    float analyse (const float* x, float& aperiodicity) const
+    // One-shot analysis (offline use). x points at getRequiredLength() samples.
+    float analyse (const float* x, float& aperiodicity)
     {
+        begin (x);
+        while (!step (maxLag))
+        {
+        }
+        return result (aperiodicity);
+    }
+
+    // Incremental analysis for the audio thread: begin() copies the frame, step()
+    // computes a slice of lags, so the O(W * maxLag) cost is spread over many samples.
+    void begin (const float* x)
+    {
+        std::copy (x, x + getRequiredLength(), frame.begin());
         double energy = 0.0;
         for (int j = 0; j < window; ++j)
-            energy += (double) x[j] * x[j];
+            energy += (double) frame[(size_t) j] * frame[(size_t) j];
+        silent = energy / window < 1.0e-6; // about -60 dBFS RMS
+        nextTau = 1;
+        running = 0.0;
+        diff[0] = 1.0f;
+    }
 
-        aperiodicity = 1.0f;
-        if (energy / window < 1.0e-6) // about -60 dBFS RMS
-            return 0.0f;
-
-        auto& d = const_cast<std::vector<float>&> (diff);
-        d[0] = 1.0f;
-        double running = 0.0;
-        for (int tau = 1; tau <= maxLag; ++tau)
+    // Returns true when all lags are done.
+    bool step (int numTaus)
+    {
+        if (silent)
+            return true;
+        const float* x = frame.data();
+        const int end = std::min (maxLag, nextTau + numTaus - 1);
+        for (int tau = nextTau; tau <= end; ++tau)
         {
-            double sum = 0.0;
-            for (int j = 0; j < window; ++j)
+            const float* y = x + tau;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            int j = 0;
+            for (; j + 4 <= window; j += 4)
             {
-                const float delta = x[j] - x[j + tau];
-                sum += (double) delta * delta;
+                const float d0 = x[j] - y[j], d1 = x[j + 1] - y[j + 1], d2 = x[j + 2] - y[j + 2], d3 = x[j + 3] - y[j + 3];
+                s0 += d0 * d0;
+                s1 += d1 * d1;
+                s2 += d2 * d2;
+                s3 += d3 * d3;
+            }
+            double sum = (double) s0 + s1 + s2 + s3;
+            for (; j < window; ++j)
+            {
+                const float d = x[j] - y[j];
+                sum += (double) d * d;
             }
             running += sum;
-            d[(size_t) tau] = running > 0.0 ? (float) (sum * tau / running) : 1.0f;
+            diff[(size_t) tau] = running > 0.0 ? (float) (sum * tau / running) : 1.0f;
         }
+        nextTau = end + 1;
+        return nextTau > maxLag;
+    }
+
+    float result (float& aperiodicity) const
+    {
+        aperiodicity = 1.0f;
+        if (silent)
+            return 0.0f;
+        const auto& d = diff;
 
         int best = -1;
         for (int tau = minLag; tau < maxLag; ++tau)
@@ -111,7 +150,10 @@ private:
 
     double sr = 44100.0;
     int minLag = 2, maxLag = 800, window = 800;
-    std::vector<float> diff;
+    std::vector<float> diff, frame;
+    int nextTau = 1;
+    double running = 0.0;
+    bool silent = true;
 };
 
 class VoiceShifter
@@ -133,6 +175,8 @@ public:
         yin.prepare (sr / decim, kMinF0, kMaxF0);
         yinLen = yin.getRequiredLength();
         yinHop = 256;
+        // Finish each analysis within ~3/4 of a hop so work never piles up.
+        yinTausPerSample = std::max (1, (int) std::ceil (yin.getMaxLag() / (0.75 * yinHop)));
 
         const double lpHz = 900.0;
         lpCoeff = (float) (1.0 - std::exp (-2.0 * 3.141592653589793 * lpHz / sr));
@@ -183,6 +227,8 @@ public:
         decWrite = 0;
         decFilled = 0;
         hopCount = 0;
+        yinPending = false;
+        yinPendingCentre = 0;
 
         estimates.assign (kEstCap, Estimate {});
         estHead = 0;
@@ -216,6 +262,13 @@ public:
     }
 
     float getDetectedHz() const { return lastDetectedHz; }
+
+    // Lightweight counters for profiling/tests.
+    struct Stats
+    {
+        uint64_t grains = 0, grainSamples = 0, yinBegins = 0, yinCatchUps = 0, marks = 0;
+    };
+    const Stats& getStats() const { return stats; }
 
     int getNumChannels() const { return numCh; }
 
@@ -319,13 +372,35 @@ private:
         if (decFilled < yinLen)
             ++decFilled;
 
+        // Continue a running analysis a few lags per sample.
+        if (yinPending && yin.step (yinTausPerSample))
+        {
+            yinPending = false;
+            publishEstimate();
+        }
+
         if (++hopCount < yinHop || decFilled < yinLen)
             return;
         hopCount = 0;
 
-        const float* window = &decBuf[(size_t) decWrite];
+        if (yinPending)
+        {
+            ++stats.yinCatchUps;
+            while (!yin.step (yinTausPerSample))
+            {
+            }
+            publishEstimate();
+        }
+        ++stats.yinBegins;
+        yin.begin (&decBuf[(size_t) decWrite]);
+        yinPendingCentre = inPos - (int64_t) (yinLen * decim / 2);
+        yinPending = true;
+    }
+
+    void publishEstimate()
+    {
         float aperiodicity = 1.0f;
-        float period = yin.analyse (window, aperiodicity) * (float) decim;
+        float period = yin.result (aperiodicity) * (float) decim;
 
         // Median of three kills isolated octave jumps.
         periodHistory[0] = periodHistory[1];
@@ -338,7 +413,7 @@ private:
         }
 
         Estimate e;
-        e.centre = inPos - (int64_t) (yinLen * decim / 2);
+        e.centre = yinPendingCentre;
         e.voiced = period > 0.0f && period <= (float) tMax;
         e.period = e.voiced ? period : 0.0f;
         lastDetectedHz = e.voiced ? (float) (sr / period) : 0.0f;
@@ -377,6 +452,7 @@ private:
             if (synCursorAbs > 0)
                 --synCursorAbs;
         }
+        ++stats.marks;
         marks[(size_t) ((markHead + markCount) % kMarkCap)] = m;
         ++markCount;
     }
@@ -584,6 +660,8 @@ private:
         const int64_t first = (int64_t) std::ceil (centre - halfLen);
         const int64_t last = (int64_t) std::floor (centre + halfLen);
         const double invHalf = 3.141592653589793 / halfLen;
+        ++stats.grains;
+        stats.grainSamples += (uint64_t) (last - first + 1);
 
         for (int64_t n = first; n <= last; ++n)
         {
@@ -605,7 +683,9 @@ private:
     double uvHop = 220.0;
 
     YinDetector yin;
-    int yinLen = 0, yinHop = 256;
+    int yinLen = 0, yinHop = 256, yinTausPerSample = 4;
+    bool yinPending = false;
+    int64_t yinPendingCentre = 0;
 
     int numCh = 1;
     std::vector<std::vector<float>> inBuf, outBuf;
@@ -636,6 +716,7 @@ private:
     float neutralFade = 0.0f, fadeCoeff = 0.001f;
     float pitchSm = 0.0f, formantSm = 0.0f;
     bool smoothInit = false;
+    Stats stats;
     double lastHop = 1.0;
 };
 
