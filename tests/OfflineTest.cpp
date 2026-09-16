@@ -1,0 +1,352 @@
+// Offline verification of the VoiceShifter DSP.
+// Synthesises a vowel (glottal pulse train through formant resonators), runs it
+// through every mode and checks output pitch (YIN) and spectral centroid.
+// Also writes WAV files to the output directory for listening.
+
+#include "../Source/dsp/VoiceShifter.h"
+
+#include <chrono>
+#include <cstdio>
+#include <fstream>
+#include <string>
+
+using namespace txiki;
+
+static const double kPi = 3.141592653589793;
+
+struct Resonator
+{
+    double b0 = 0, a1 = 0, a2 = 0, y1 = 0, y2 = 0;
+    Resonator (double freq, double bw, double sr)
+    {
+        const double r = std::exp (-kPi * bw / sr);
+        a1 = -2.0 * r * std::cos (2.0 * kPi * freq / sr);
+        a2 = r * r;
+        b0 = 1.0 - r;
+    }
+    double process (double x)
+    {
+        const double y = b0 * x - a1 * y1 - a2 * y2;
+        y2 = y1;
+        y1 = y;
+        return y;
+    }
+};
+
+static std::vector<float> makeVowel (double sr, double seconds, double f0, double vibratoCents, double formantScale = 1.0)
+{
+    std::vector<float> out ((size_t) (sr * seconds));
+    Resonator f1 (700 * formantScale, 90, sr), f2 (1220 * formantScale, 110, sr), f3 (2600 * formantScale, 170, sr);
+    double phase = 0.0, prev = 0.0;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        const double t = (double) i / sr;
+        const double f = f0 * std::pow (2.0, vibratoCents * std::sin (2.0 * kPi * 5.0 * t) / 1200.0);
+        phase += f / sr;
+        if (phase >= 1.0)
+            phase -= 1.0;
+        // Rosenberg-like glottal flow derivative.
+        const double open = 0.6;
+        double g = phase < open ? 0.5 * (1.0 - std::cos (kPi * phase / open)) : std::cos (kPi * (phase - open) / (2.0 * (1.0 - open)));
+        if (phase >= open)
+            g = std::max (0.0, g);
+        const double dg = g - prev;
+        prev = g;
+        const double s = f1.process (dg) * 1.0 + f2.process (dg) * 0.6 + f3.process (dg) * 0.3;
+        out[i] = (float) s;
+    }
+    float peak = 1.0e-9f;
+    for (auto v : out)
+        peak = std::max (peak, std::abs (v));
+    for (auto& v : out)
+        v *= 0.5f / peak;
+    return out;
+}
+
+static void writeWav (const std::string& path, const std::vector<float>& data, int sr)
+{
+    std::ofstream f (path, std::ios::binary);
+    auto w32 = [&] (uint32_t v) { f.write ((const char*) &v, 4); };
+    auto w16 = [&] (uint16_t v) { f.write ((const char*) &v, 2); };
+    const uint32_t bytes = (uint32_t) data.size() * 2;
+    f.write ("RIFF", 4);
+    w32 (36 + bytes);
+    f.write ("WAVEfmt ", 8);
+    w32 (16);
+    w16 (1);
+    w16 (1);
+    w32 ((uint32_t) sr);
+    w32 ((uint32_t) sr * 2);
+    w16 (2);
+    w16 (16);
+    f.write ("data", 4);
+    w32 (bytes);
+    for (auto v : data)
+    {
+        const int16_t s = (int16_t) std::lround (std::clamp (v, -1.0f, 1.0f) * 32767.0f);
+        f.write ((const char*) &s, 2);
+    }
+}
+
+// Median pitch over the steady part of the signal.
+static double measurePitch (const std::vector<float>& x, double sr, size_t start, size_t end)
+{
+    YinDetector yin;
+    yin.prepare (sr, 60.0, 1100.0);
+    const int len = yin.getRequiredLength();
+    std::vector<double> values;
+    for (size_t i = start; i + (size_t) len < end; i += 512)
+    {
+        float ap = 0;
+        const float p = yin.analyse (&x[i], ap);
+        if (p > 0)
+            values.push_back (sr / p);
+    }
+    if (values.empty())
+        return 0.0;
+    std::sort (values.begin(), values.end());
+    return values[values.size() / 2];
+}
+
+// Harmonic magnitude profile (dB) at multiples of f0 between 200 Hz and 3.5 kHz.
+static std::vector<double> harmonicProfile (const std::vector<float>& x, double sr, size_t start, double f0)
+{
+    std::vector<double> prof;
+    const size_t n = (size_t) (1.0 * sr);
+    for (int h = 1; h * f0 < 3500.0; ++h)
+    {
+        const double freq = h * f0;
+        if (freq < 200.0)
+            continue;
+        double re = 0, im = 0;
+        for (size_t i = 0; i < n && start + i < x.size(); ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos (2 * kPi * i / (n - 1));
+            const double ang = 2 * kPi * freq * i / sr;
+            re += x[start + i] * w * std::cos (ang);
+            im += x[start + i] * w * std::sin (ang);
+        }
+        prof.push_back (10.0 * std::log10 (re * re + im * im + 1e-20));
+    }
+    return prof;
+}
+
+// RMS dB distance after removing overall level difference.
+static double profileDistance (const std::vector<double>& a, const std::vector<double>& b)
+{
+    const size_t n = std::min (a.size(), b.size());
+    if (n == 0)
+        return 1e9;
+    double mean = 0;
+    for (size_t i = 0; i < n; ++i)
+        mean += a[i] - b[i];
+    mean /= n;
+    double acc = 0;
+    for (size_t i = 0; i < n; ++i)
+        acc += std::pow (a[i] - b[i] - mean, 2.0);
+    return std::sqrt (acc / n);
+}
+struct Case
+{
+    std::string name;
+    Mode mode;
+    float pitch, formant;
+    bool link;
+    double f0;
+    double expectHz;       // expected output pitch
+    double expectF1Ratio;  // expected F1 ratio vs input
+};
+
+int main (int argc, char** argv)
+{
+    const std::string outDir = argc > 1 ? argv[1] : ".";
+    const double sr = 48000.0;
+    int failures = 0;
+
+    const Case cases[] = {
+        { "transpose_+5", Mode::Transpose, 5.0f, 0.0f, false, 180.0, 180.0 * std::pow (2.0, 5.0 / 12.0), 1.0 },
+        { "transpose_-12", Mode::Transpose, -12.0f, 0.0f, false, 220.0, 110.0, 1.0 },
+        { "transpose_+12", Mode::Transpose, 12.0f, 0.0f, false, 150.0, 300.0, 1.0 },
+        { "formant_+6", Mode::Transpose, 0.0f, 6.0f, false, 160.0, 160.0, std::pow (2.0, 6.0 / 12.0) },
+        { "formant_-5", Mode::Transpose, 0.0f, -5.0f, false, 160.0, 160.0, std::pow (2.0, -5.0 / 12.0) },
+        { "link_+7", Mode::Transpose, 7.0f, 0.0f, true, 150.0, 150.0 * std::pow (2.0, 7.0 / 12.0), std::pow (2.0, 7.0 / 12.0) },
+        { "quantize", Mode::Quantize, 0.0f, 0.0f, false, 226.0, 220.0, 1.0 },
+        { "quantize_+3", Mode::Quantize, 3.0f, 0.0f, false, 226.0, 220.0 * std::pow (2.0, 3.0 / 12.0), 1.0 },
+        { "robot", Mode::Robot, 0.0f, 0.0f, false, 170.0, 523.2511, 1.0 },
+        { "robot_-12", Mode::Robot, -12.0f, 0.0f, false, 170.0, 261.6256, 1.0 },
+    };
+
+    for (const auto& c : cases)
+    {
+        const auto input = makeVowel (sr, 3.0, c.f0, c.mode == Mode::Transpose ? 0.0 : 0.0);
+        VoiceShifter vs;
+        vs.prepare (sr);
+        vs.setParameters (c.mode, c.pitch, c.formant, c.link);
+
+        std::vector<float> out (input.size());
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (size_t i = 0; i < input.size(); ++i)
+            out[i] = vs.processSample (input[i]);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double secs = std::chrono::duration<double> (t1 - t0).count();
+
+        const size_t start = (size_t) (1.0 * sr), end = (size_t) (2.8 * sr);
+        const double hz = measurePitch (out, sr, start, end);
+        // Formant check: compare against ideal vowels at the output pitch.
+        const double pitchRatio = c.expectHz / c.f0;
+        const double wrongScale = std::abs (c.expectF1Ratio - 1.0) < 1e-6 ? pitchRatio : 1.0;
+        const auto outProf = harmonicProfile (out, sr, start, c.expectHz);
+        const double dRight = profileDistance (outProf, harmonicProfile (makeVowel (sr, 3.0, c.expectHz, 0.0, c.expectF1Ratio), sr, start, c.expectHz));
+        const double dWrong = profileDistance (outProf, harmonicProfile (makeVowel (sr, 3.0, c.expectHz, 0.0, wrongScale), sr, start, c.expectHz));
+        double peak = 0, rmsIn = 0, rmsOut = 0;
+        for (size_t i = start; i < end; ++i)
+        {
+            peak = std::max (peak, (double) std::abs (out[i]));
+            rmsIn += (double) input[i] * input[i];
+            rmsOut += (double) out[i] * out[i];
+        }
+        const double gainDb = 10.0 * std::log10 ((rmsOut + 1e-12) / (rmsIn + 1e-12));
+
+        const double centsErr = 1200.0 * std::log2 (std::max (hz, 1.0) / c.expectHz);
+        const bool pitchOk = std::abs (centsErr) < 25.0;
+        const bool formantOk = std::abs (wrongScale - 1.0) < 0.03 || (dRight < dWrong && dRight < 6.0);
+        const bool ok = pitchOk && formantOk && std::abs (gainDb) < 6.0;
+        if (!ok)
+            ++failures;
+
+        std::printf ("%-14s out=%7.2fHz exp=%7.2f (%+6.1fc) envelope dist right=%4.1fdB wrong=%4.1fdB gain=%+.1fdB rt=%.3fx %s\n",
+                     c.name.c_str(), hz, c.expectHz, centsErr, dRight, dWrong, gainDb,
+                     secs / 3.0, ok ? "OK" : "FAIL");
+
+        writeWav (outDir + "/" + c.name + ".wav", out, (int) sr);
+    }
+
+    // Robustness: silence, glide with vibrato, noise burst, loud section, several sample rates.
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        std::vector<float> sig ((size_t) (rate * 0.5), 0.0f);
+        {
+            std::vector<float> glide ((size_t) (rate * 2.0));
+            Resonator r1 (650, 90, rate), r2 (1100, 110, rate);
+            double ph = 0.0;
+            for (size_t i = 0; i < glide.size(); ++i)
+            {
+                const double t = (double) i / rate;
+                const double f = 110.0 * std::pow (4.0, t / 2.0) * std::pow (2.0, 40.0 * std::sin (2 * kPi * 5.5 * t) / 1200.0);
+                ph += f / rate;
+                const double pulse = ph >= 1.0 ? 1.0 : 0.0;
+                if (ph >= 1.0)
+                    ph -= 1.0;
+                glide[i] = (float) (r1.process (pulse) + 0.5 * r2.process (pulse)) * 0.35f;
+            }
+            sig.insert (sig.end(), glide.begin(), glide.end());
+        }
+        uint32_t seed = 1;
+        for (int i = 0; i < (int) (rate * 0.3); ++i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            sig.push_back ((float) ((seed >> 8) / 16777216.0 - 0.5) * 0.3f);
+        }
+        const auto loud = makeVowel (rate, 1.0, 140.0, 30.0);
+        for (auto v : loud)
+            sig.push_back (v * 1.9f);
+
+        for (int modeIdx = 0; modeIdx < 3; ++modeIdx)
+            for (bool link : { false, true })
+            {
+                VoiceShifter vs;
+                vs.prepare (rate);
+                vs.setParameters ((Mode) modeIdx, modeIdx == 2 ? -5.0f : 7.0f, link ? 0.0f : -4.0f, link);
+                double peak = 0;
+                bool finite = true;
+                std::vector<float> out (sig.size());
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                for (size_t i = 0; i < sig.size(); ++i)
+                {
+                    out[i] = vs.processSample (sig[i]);
+                    finite = finite && std::isfinite (out[i]);
+                    peak = std::max (peak, (double) std::abs (out[i]));
+                }
+                const double secs = std::chrono::duration<double> (std::chrono::high_resolution_clock::now() - t0).count();
+                const bool ok = finite && peak < 3.0;
+                if (!ok)
+                    ++failures;
+                std::printf ("robust sr=%6.0f mode=%d link=%d peak=%.2f cpu=%.3fx realtime %s\n", rate, modeIdx, (int) link, peak,
+                             secs / (sig.size() / rate), ok ? "OK" : "FAIL");
+                if (rate == 48000.0)
+                    writeWav (outDir + "/robust_mode" + std::to_string (modeIdx) + (link ? "_link" : "") + ".wav", out, (int) rate);
+            }
+        if (rate == 48000.0)
+            writeWav (outDir + "/robust_input.wav", sig, (int) rate);
+
+        // Neutral settings should be (nearly) transparent after latency compensation.
+        VoiceShifter vs;
+        vs.prepare (rate);
+        vs.setParameters (Mode::Transpose, 0.0f, 0.0f, false);
+        const int lat = vs.getLatencySamples();
+        double sigE = 0, errE = 0;
+        for (size_t i = 0; i < sig.size(); ++i)
+        {
+            const float y = vs.processSample (sig[i]);
+            if (i >= (size_t) lat + (size_t) rate)
+            {
+                const float ref = sig[i - (size_t) lat];
+                sigE += (double) ref * ref;
+                errE += (double) (y - ref) * (y - ref);
+            }
+        }
+        const double snr = 10 * std::log10 (sigE / (errE + 1e-12));
+        std::printf ("neutral sr=%6.0f SNR vs dry = %.1f dB %s\n", rate, snr, snr > 40.0 ? "OK" : "FAIL");
+        if (snr <= 40.0)
+            ++failures;
+    }
+
+    // Stereo image: R = 0.5 * L delayed by 15 samples. Output must keep level ratio and inter-channel delay.
+    for (int modeIdx = 0; modeIdx < 3; ++modeIdx)
+    {
+        const auto mono = makeVowel (sr, 3.0, 170.0, 20.0);
+        VoiceShifter vs;
+        vs.prepare (sr, 2);
+        vs.setParameters ((Mode) modeIdx, modeIdx == 2 ? -3.0f : 5.0f, -2.0f, false);
+        std::vector<float> outL (mono.size()), outR (mono.size());
+        for (size_t i = 0; i < mono.size(); ++i)
+        {
+            const float in[2] = { mono[i], i >= 15 ? 0.5f * mono[i - 15] : 0.0f };
+            float o[2];
+            vs.processFrame (in, o);
+            outL[i] = o[0];
+            outR[i] = o[1];
+        }
+        const size_t s0 = (size_t) sr, s1 = (size_t) (2.8 * sr);
+        int bestLag = 0;
+        double bestCorr = -1e30;
+        for (int lag = -40; lag <= 40; ++lag)
+        {
+            double acc = 0;
+            for (size_t i = s0; i < s1; ++i)
+                acc += (double) outL[i] * outR[(size_t) ((int64_t) i + lag)];
+            if (acc > bestCorr)
+            {
+                bestCorr = acc;
+                bestLag = lag;
+            }
+        }
+        double eL = 0, eR = 0;
+        for (size_t i = s0; i < s1; ++i)
+        {
+            eL += (double) outL[i] * outL[i];
+            eR += (double) outR[i] * outR[i];
+        }
+        const double ratio = std::sqrt (eR / eL);
+        const double expLag = 15.0 / std::pow (2.0, -2.0 / 12.0); // formant stretch scales intra-grain time
+        const bool ok = std::abs (bestLag - expLag) <= 2.5 && std::abs (ratio - 0.5) < 0.05;
+        if (!ok)
+            ++failures;
+        std::printf ("stereo mode=%d  R/L level=%.3f (exp 0.500)  R delay=%d (exp %.1f) %s\n", modeIdx, ratio, bestLag, expLag, ok ? "OK" : "FAIL");
+    }
+
+    writeWav (outDir + "/input_vowel.wav", makeVowel (sr, 3.0, 180.0, 0.0), (int) sr);
+    std::printf ("latency @48k: %d samples\n", [] { VoiceShifter v; v.prepare (48000.0); return v.getLatencySamples(); }());
+    std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILED", failures);
+    return failures == 0 ? 0 : 1;
+}
