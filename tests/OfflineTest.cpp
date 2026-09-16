@@ -388,12 +388,12 @@ int main (int argc, char** argv)
 
     // Aliasing: bright band-limited vowel shifted up; report inharmonic energy.
     {
-        struct AliasCase { const char* name; Mode mode; float pitch, formant; bool link; double outF0; };
+        struct AliasCase { const char* name; Mode mode; float pitch, formant; bool link; double outF0; double maxDb; };
         const AliasCase aliasCases[] = {
-            { "formant+12", Mode::Transpose, 0.0f, 12.0f, false, 200.0 },
-            { "formant+6", Mode::Transpose, 0.0f, 6.0f, false, 200.0 },
-            { "link+12", Mode::Transpose, 12.0f, 0.0f, true, 400.0 },
-            { "pitch+7", Mode::Transpose, 7.0f, 0.0f, false, 200.0 * std::pow (2.0, 7.0 / 12.0) },
+            { "formant+12", Mode::Transpose, 0.0f, 12.0f, false, 197.3, -45.0 },
+            { "formant+6", Mode::Transpose, 0.0f, 6.0f, false, 197.3, -45.0 },
+            { "link+12", Mode::Transpose, 12.0f, 0.0f, true, 394.6, -45.0 },
+            { "pitch+7", Mode::Transpose, 7.0f, 0.0f, false, 197.3 * std::pow (2.0, 7.0 / 12.0), -26.0 },
         };
         const auto bright = makeBrightVowel (sr, 2.0, 197.3);
         const double inputInh = inharmonicDb (bright, sr, (size_t) sr / 2, 197.3);
@@ -407,7 +407,10 @@ int main (int argc, char** argv)
                 out[i] = vs.processSample (bright[i]);
             const double measured = measurePitch (out, sr, (size_t) (0.9 * sr), (size_t) (1.9 * sr));
             const double inh = inharmonicDb (out, sr, (size_t) (0.9 * sr), measured > 0 ? measured : ac.outF0);
-            std::printf ("alias %-11s inharmonic=%6.1f dB (input %6.1f dB)\n", ac.name, inh, inputInh);
+            const bool ok = inh < ac.maxDb;
+            if (!ok)
+                ++failures;
+            std::printf ("alias %-11s inharmonic=%6.1f dB (limit %5.1f, input %6.1f dB) %s\n", ac.name, inh, ac.maxDb, inputInh, ok ? "OK" : "FAIL");
             writeWav (outDir + "/alias_" + ac.name + ".wav", out, (int) sr);
         }
     }

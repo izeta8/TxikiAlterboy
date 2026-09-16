@@ -302,6 +302,13 @@ void TxikiAlterboyProcessor::setStateInformation (const void* data, int sizeInBy
             auto tree = juce::ValueTree::fromXml (*xml);
             currentProgram = tree.getProperty ("program", 0);
             apvts.replaceState (tree);
+
+            // replaceState skips parameters whose denormalised value looks unchanged, which
+            // leaves e.g. a bool holding a host-written 0.17. Push every value explicitly.
+            for (auto* p : getParameters())
+                if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p))
+                    if (auto* stored = apvts.getRawParameterValue (ranged->getParameterID()))
+                        ranged->setValueNotifyingHost (ranged->convertTo0to1 (stored->load()));
         }
 }
 
