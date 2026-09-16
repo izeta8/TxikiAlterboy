@@ -15,6 +15,7 @@ inline constexpr const char* mode = "mode";
 inline constexpr const char* drive = "drive";
 inline constexpr const char* mix = "mix";
 inline constexpr const char* midi = "midi";
+inline constexpr const char* bypass = "bypass";
 } // namespace ParamIDs
 
 class TxikiAlterboyProcessor : public juce::AudioProcessor
@@ -36,6 +37,7 @@ public:
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 0.1; }
+    juce::AudioProcessorParameter* getBypassParameter() const override { return apvts.getParameter (ParamIDs::bypass); }
 
     int getNumPrograms() override;
     int getCurrentProgram() override { return currentProgram; }
@@ -69,7 +71,7 @@ private:
     int latency = 0;
     int driveLatency = 0;
 
-    juce::SmoothedValue<float> mixSmoothed, driveSmoothed;
+    juce::SmoothedValue<float> mixSmoothed, driveSmoothed, bypassSmoothed;
 
     std::vector<int> heldNotes;
     int currentProgram = 0;
@@ -81,6 +83,7 @@ private:
     std::atomic<float>* pDrive = nullptr;
     std::atomic<float>* pMix = nullptr;
     std::atomic<float>* pMidi = nullptr;
+    std::atomic<float>* pBypass = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TxikiAlterboyProcessor)
 };

@@ -150,6 +150,21 @@ public:
         decBuf.assign ((size_t) yinLen * 2, 0.0f);
         yinScratch.assign ((size_t) yinLen, 0.0f);
 
+        if (sincTable.empty())
+        {
+            // Blackman-windowed sinc, cutoff 0.92 x Nyquist of the stretched grid.
+            sincTable.resize ((size_t) (kSincZeros * kSincRes) + 2);
+            for (size_t i = 0; i < sincTable.size(); ++i)
+            {
+                const double u = (double) i / kSincRes;
+                const double x = 3.141592653589793 * 0.92 * u;
+                const double sinc = u == 0.0 ? 1.0 : std::sin (x) / x;
+                const double t = std::min (1.0, u / kSincZeros);
+                const double win = 0.42 + 0.5 * std::cos (3.141592653589793 * t) + 0.08 * std::cos (2.0 * 3.141592653589793 * t);
+                sincTable[i] = (float) (sinc * win);
+            }
+        }
+
         reset();
     }
 
@@ -178,7 +193,7 @@ public:
         marks.assign (kMarkCap, Mark {});
         markHead = 0;
         markCount = 0;
-        pushMark ({ 0, (float) uvHop, false });
+        pushMark ({ 0.0, (float) uvHop, false });
         nextMarkPos = uvHop;
 
         nextSyn = 0.0;
@@ -269,13 +284,17 @@ private:
 
     struct Mark
     {
-        int64_t pos = 0;
+        double pos = 0.0; // fractional: sub-sample epoch accuracy keeps the high band coherent
         float period = 0.0f;
         bool voiced = false;
     };
 
     static constexpr int kEstCap = 256;
     static constexpr int kMarkCap = 1024;
+    static constexpr double kEpochPull = 0.15;
+    static constexpr int kSincZeros = 6;
+    static constexpr int kSincRes = 512;
+    std::vector<float> sincTable;
 
     // ---------------------------------------------------------------- detection
     void feedDetector (float x)
@@ -376,42 +395,50 @@ private:
             if (est.voiced)
             {
                 const float period = est.period;
-                if (!last.voiced)
-                    candidate = last.pos + (int64_t) std::llround (std::min ((double) period, uvHop));
-                else
-                    candidate = last.pos + (int64_t) std::llround (period);
+                double expected = last.voiced ? last.pos + period
+                                              : last.pos + std::min ((double) period, uvHop);
 
                 const int radius = std::max (1, (int) (period * 0.2f));
-                if (candidate + radius >= limit)
+                const int64_t centreIdx = (int64_t) std::llround (expected);
+                if (centreIdx + radius + 1 >= limit)
                     return;
 
-                // Snap to the strongest low-passed peak near the expected epoch.
+                // Locate the strongest low-passed peak near the expected epoch (sub-sample).
                 float peakAbs = 1.0e-9f;
-                for (int64_t n = candidate - radius; n <= candidate + radius; ++n)
+                for (int64_t n = centreIdx - radius; n <= centreIdx + radius; ++n)
                     peakAbs = std::max (peakAbs, std::abs (lpBuf[(size_t) (n & mask)]));
                 double bestScore = -1.0e30;
-                int64_t bestPos = candidate;
-                for (int64_t n = candidate - radius; n <= candidate + radius; ++n)
+                int64_t bestIdx = centreIdx;
+                for (int64_t n = centreIdx - radius; n <= centreIdx + radius; ++n)
                 {
-                    const double dist = (double) (n - candidate) / radius;
+                    const double dist = ((double) n - expected) / radius;
                     const double score = lpBuf[(size_t) (n & mask)] - 0.35 * peakAbs * dist * dist;
                     if (score > bestScore)
                     {
                         bestScore = score;
-                        bestPos = n;
+                        bestIdx = n;
                     }
                 }
-                bestPos = std::max (bestPos, last.pos + (int64_t) std::ceil (period * 0.5f));
-                pushMark ({ bestPos, period, true });
-                nextMarkPos = (double) bestPos + period;
+                const double ym = lpBuf[(size_t) ((bestIdx - 1) & mask)];
+                const double y0 = lpBuf[(size_t) (bestIdx & mask)];
+                const double yp = lpBuf[(size_t) ((bestIdx + 1) & mask)];
+                const double den = ym - 2.0 * y0 + yp;
+                const double peakPos = (double) bestIdx + (std::abs (den) > 1.0e-12 ? std::clamp (0.5 * (ym - yp) / den, -0.5, 0.5) : 0.0);
+
+                // Phase-locked epochs: follow the period exactly and only drift slowly
+                // towards the glottal peak; a fresh voiced segment snaps straight to it.
+                double pos = last.voiced ? expected + kEpochPull * (peakPos - expected) : peakPos;
+                pos = std::max (pos, last.pos + period * 0.5);
+                pushMark ({ pos, period, true });
+                nextMarkPos = pos + period;
             }
             else
             {
                 if (last.voiced)
-                    candidate = last.pos + (int64_t) std::llround (std::min ((double) last.period, uvHop));
+                    candidate = (int64_t) std::llround (last.pos + std::min ((double) last.period, uvHop));
                 if (candidate >= limit)
                     return;
-                pushMark ({ candidate, (float) uvHop, false });
+                pushMark ({ (double) candidate, (float) uvHop, false });
                 nextMarkPos = (double) candidate + uvHop;
             }
         }
@@ -435,6 +462,31 @@ private:
         return ((c3 * t + c2) * t + c1) * t + x0;
     }
 
+    // Band-limited read for rate > 1 (grain compressed in time): windowed sinc whose
+    // cutoff follows 1/rate so upward formant shifts do not fold back as aliasing.
+    float readInputBandLimited (const std::vector<float>& buf, double pos, double rate) const
+    {
+        if (rate <= 1.0001)
+            return readInput (buf, pos);
+        const double span = kSincZeros * rate;
+        const int64_t n0 = (int64_t) std::ceil (pos - span);
+        const int64_t n1 = (int64_t) std::floor (pos + span);
+        const double scale = (double) kSincRes / rate;
+        double acc = 0.0, wsum = 0.0;
+        for (int64_t n = n0; n <= n1; ++n)
+        {
+            const double u = std::abs ((double) n - pos) * scale;
+            const size_t idx = (size_t) u;
+            if (idx + 1 >= sincTable.size())
+                continue;
+            const double frac = u - (double) idx;
+            const double w = sincTable[idx] + frac * (sincTable[idx + 1] - sincTable[idx]);
+            acc += w * buf[(size_t) (n & mask)];
+            wsum += w;
+        }
+        return wsum > 1.0e-9 ? (float) (acc / wsum) : 0.0f;
+    }
+
     void placeGrain()
     {
         const int64_t s = (int64_t) std::floor (nextSyn);
@@ -442,14 +494,14 @@ private:
         // Floor analysis mark (<= s).
         if (synCursorAbs >= markCount)
             synCursorAbs = markCount - 1;
-        while (synCursorAbs + 1 < markCount && markAt (synCursorAbs + 1).pos <= s)
+        while (synCursorAbs + 1 < markCount && markAt (synCursorAbs + 1).pos <= (double) s)
             ++synCursorAbs;
         Mark a = markAt (synCursorAbs);
         // Prefer the nearest voiced epoch so small corrections stay time-aligned with the dry signal.
         if (a.voiced && synCursorAbs + 1 < markCount)
         {
             const Mark& next = markAt (synCursorAbs + 1);
-            if (next.voiced && (double) next.pos - nextSyn < nextSyn - (double) a.pos)
+            if (next.voiced && next.pos - nextSyn < nextSyn - a.pos)
                 a = next;
         }
 
@@ -493,12 +545,12 @@ private:
             // analysis epochs so wet and dry stay phase-coherent (no comb when mixing).
             const double align = std::clamp (1.0 - std::abs (target - midiIn) / 0.15, 0.0, 1.0);
             voicedMakeup = 1.0 + 0.2 * std::min (1.0, (double) std::abs (target - midiIn));
-            hop -= align * 0.5 * (nextSyn - (double) a.pos);
+            hop -= align * 0.5 * (nextSyn - a.pos);
             readRate = link ? ratio : formantRatio;
             // Two source periods around the epoch: neighbouring pulses fall on
             // the window zeros, so each grain is (almost) one glottal response.
             halfLen = T / readRate;
-            readCentre = (double) a.pos;
+            readCentre = a.pos;
         }
         else
         {
@@ -540,7 +592,7 @@ private:
             const float gw = (float) (gain * w);
             const double src = readCentre + k * readRate;
             for (int ch = 0; ch < numCh; ++ch)
-                outBuf[(size_t) ch][(size_t) (n & mask)] += gw * readInput (inBuf[(size_t) ch], src);
+                outBuf[(size_t) ch][(size_t) (n & mask)] += gw * readInputBandLimited (inBuf[(size_t) ch], src, readRate);
         }
 
         lastRatio = ratio;

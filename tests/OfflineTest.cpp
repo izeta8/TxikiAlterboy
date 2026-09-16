@@ -146,6 +146,91 @@ static double profileDistance (const std::vector<double>& a, const std::vector<d
         acc += std::pow (a[i] - b[i] - mean, 2.0);
     return std::sqrt (acc / n);
 }
+
+// In-place radix FFT (n power of two).
+static void fft (std::vector<double>& re, std::vector<double>& im)
+{
+    const size_t n = re.size();
+    for (size_t i = 1, j = 0; i < n; ++i)
+    {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1)
+            j ^= bit;
+        j ^= bit;
+        if (i < j)
+        {
+            std::swap (re[i], re[j]);
+            std::swap (im[i], im[j]);
+        }
+    }
+    for (size_t len = 2; len <= n; len <<= 1)
+    {
+        const double ang = -2 * kPi / (double) len;
+        const double wr = std::cos (ang), wi = std::sin (ang);
+        for (size_t i = 0; i < n; i += len)
+        {
+            double cr = 1, ci = 0;
+            for (size_t k = 0; k < len / 2; ++k)
+            {
+                const double ur = re[i + k], ui = im[i + k];
+                const double vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+                const double vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+                re[i + k] = ur + vr;
+                im[i + k] = ui + vi;
+                re[i + k + len / 2] = ur - vr;
+                im[i + k + len / 2] = ui - vi;
+                const double nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+        }
+    }
+}
+
+// Band-limited bright vowel: additive harmonics up to Nyquist with formant envelope.
+static std::vector<float> makeBrightVowel (double sr, double seconds, double f0)
+{
+    std::vector<float> out ((size_t) (sr * seconds), 0.0f);
+    auto env = [] (double f)
+    {
+        auto peak = [f] (double fc, double bw) { return 1.0 / (1.0 + std::pow ((f - fc) / bw, 2.0)); };
+        return 0.15 + peak (700, 120) + 0.6 * peak (1220, 150) + 0.4 * peak (2600, 250) + 0.3 * peak (3500, 400);
+    };
+    for (int h = 1; h * f0 < 0.48 * sr; ++h)
+    {
+        const double a = env (h * f0) / std::sqrt ((double) h);
+        const double w = 2 * kPi * h * f0 / sr;
+        for (size_t i = 0; i < out.size(); ++i)
+            out[i] += (float) (a * std::sin (w * i));
+    }
+    float peak = 1e-9f;
+    for (auto v : out)
+        peak = std::max (peak, std::abs (v));
+    for (auto& v : out)
+        v *= 0.5f / peak;
+    return out;
+}
+
+// Energy away from the harmonics of f0 relative to harmonic energy, 1 kHz..20 kHz, in dB.
+static double inharmonicDb (const std::vector<float>& x, double sr, size_t start, double f0)
+{
+    const size_t n = 32768;
+    std::vector<double> re (n), im (n, 0.0);
+    for (size_t i = 0; i < n; ++i)
+        re[i] = x[start + i] * (0.5 - 0.5 * std::cos (2 * kPi * i / (n - 1)));
+    fft (re, im);
+    double harm = 0, inh = 0;
+    for (size_t k = (size_t) (1000.0 * n / sr); k < (size_t) (20000.0 * n / sr); ++k)
+    {
+        const double freq = k * sr / n;
+        const double p = re[k] * re[k] + im[k] * im[k];
+        const double h = freq / f0;
+        const double distHz = std::abs (h - std::round (h)) * f0;
+        (distHz < 12.0 ? harm : inh) += p;
+    }
+    return 10 * std::log10 ((inh + 1e-30) / (harm + 1e-30));
+}
+
 struct Case
 {
     std::string name;
@@ -299,6 +384,32 @@ int main (int argc, char** argv)
         std::printf ("neutral sr=%6.0f SNR vs dry = %.1f dB %s\n", rate, snr, snr > 40.0 ? "OK" : "FAIL");
         if (snr <= 40.0)
             ++failures;
+    }
+
+    // Aliasing: bright band-limited vowel shifted up; report inharmonic energy.
+    {
+        struct AliasCase { const char* name; Mode mode; float pitch, formant; bool link; double outF0; };
+        const AliasCase aliasCases[] = {
+            { "formant+12", Mode::Transpose, 0.0f, 12.0f, false, 200.0 },
+            { "formant+6", Mode::Transpose, 0.0f, 6.0f, false, 200.0 },
+            { "link+12", Mode::Transpose, 12.0f, 0.0f, true, 400.0 },
+            { "pitch+7", Mode::Transpose, 7.0f, 0.0f, false, 200.0 * std::pow (2.0, 7.0 / 12.0) },
+        };
+        const auto bright = makeBrightVowel (sr, 2.0, 197.3);
+        const double inputInh = inharmonicDb (bright, sr, (size_t) sr / 2, 197.3);
+        for (const auto& ac : aliasCases)
+        {
+            VoiceShifter vs;
+            vs.prepare (sr);
+            vs.setParameters (ac.mode, ac.pitch, ac.formant, ac.link);
+            std::vector<float> out (bright.size());
+            for (size_t i = 0; i < bright.size(); ++i)
+                out[i] = vs.processSample (bright[i]);
+            const double measured = measurePitch (out, sr, (size_t) (0.9 * sr), (size_t) (1.9 * sr));
+            const double inh = inharmonicDb (out, sr, (size_t) (0.9 * sr), measured > 0 ? measured : ac.outF0);
+            std::printf ("alias %-11s inharmonic=%6.1f dB (input %6.1f dB)\n", ac.name, inh, inputInh);
+            writeWav (outDir + "/alias_" + ac.name + ".wav", out, (int) sr);
+        }
     }
 
     // Stereo image: R = 0.5 * L delayed by 15 samples. Output must keep level ratio and inter-channel delay.

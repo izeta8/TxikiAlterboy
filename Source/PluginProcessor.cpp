@@ -52,6 +52,7 @@ TxikiAlterboyProcessor::TxikiAlterboyProcessor()
     pDrive = apvts.getRawParameterValue (ParamIDs::drive);
     pMix = apvts.getRawParameterValue (ParamIDs::mix);
     pMidi = apvts.getRawParameterValue (ParamIDs::midi);
+    pBypass = apvts.getRawParameterValue (ParamIDs::bypass);
     heldNotes.reserve (128);
 }
 
@@ -79,6 +80,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout TxikiAlterboyProcessor::crea
     params.push_back (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::mix, 1 }, "Mix",
                                                              NormalisableRange<float> (0.0f, 1.0f), 1.0f, percent));
     params.push_back (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::midi, 1 }, "MIDI Control", true));
+    params.push_back (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::bypass, 1 }, "Bypass", false));
 
     return { params.begin(), params.end() };
 }
@@ -116,6 +118,8 @@ void TxikiAlterboyProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     mixSmoothed.setCurrentAndTargetValue (pMix->load());
     driveSmoothed.reset (sampleRate, 0.05);
     driveSmoothed.setCurrentAndTargetValue (pDrive->load());
+    bypassSmoothed.reset (sampleRate, 0.02);
+    bypassSmoothed.setCurrentAndTargetValue (pBypass->load());
 
     heldNotes.clear();
     midiActive = false;
@@ -231,11 +235,13 @@ void TxikiAlterboyProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     // Latency-compensated dry/wet.
     mixSmoothed.setTargetValue (pMix->load());
+    bypassSmoothed.setTargetValue (pBypass->load() > 0.5f ? 1.0f : 0.0f);
     const int delayLen = dryDelay.getNumSamples();
     float peak = 0.0f;
     for (int i = 0; i < numSamples; ++i)
     {
-        const float m = mixSmoothed.getNextValue();
+        // Host bypass keeps the engine running and outputs the latency-aligned dry signal.
+        const float m = mixSmoothed.getNextValue() * (1.0f - bypassSmoothed.getNextValue());
         const int readPos = dryWritePos; // buffer length = latency + 1
         for (int ch = 0; ch < numOut; ++ch)
         {
