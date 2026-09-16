@@ -187,6 +187,7 @@ public:
         currentNote = 0.0f;
         lastRatio = 1.0f;
         neutralFade = 0.0f;
+        smoothInit = false;
     }
 
     int getLatencySamples() const { return latency; }
@@ -452,7 +453,18 @@ private:
                 a = next;
         }
 
-        const float formantRatio = semisToRatio (formant);
+        // Glide knob/automation changes over ~15 ms instead of stepping at grain rate.
+        if (!smoothInit)
+        {
+            pitchSm = pitch;
+            formantSm = formant;
+            smoothInit = true;
+        }
+        const float smoothA = 1.0f - std::exp (-(float) std::max (1.0, lastHop) / (0.015f * (float) sr));
+        pitchSm += (pitch - pitchSm) * smoothA;
+        formantSm += (formant - formantSm) * smoothA;
+
+        const float formantRatio = semisToRatio (formantSm);
         double hop, halfLen, readRate, readCentre, voicedMakeup = 1.0;
         float ratio = 1.0f;
 
@@ -460,11 +472,11 @@ private:
         {
             const double T = a.period;
             const float midiIn = 69.0f + 12.0f * std::log2 ((float) (sr / T) / 440.0f);
-            float target = midiIn + pitch;
+            float target = midiIn + pitchSm;
 
             if (mode == Mode::Quantize)
             {
-                const float wanted = midiIn + pitch;
+                const float wanted = midiIn + pitchSm;
                 if (!haveNote || std::abs (wanted - currentNote) > 0.52f)
                     currentNote = std::round (wanted);
                 haveNote = true;
@@ -472,7 +484,7 @@ private:
             }
             else if (mode == Mode::Robot)
             {
-                target = 72.0f + pitch; // pitch 0 = one octave above middle C
+                target = 72.0f + pitchSm; // pitch 0 = one octave above middle C
             }
 
             ratio = std::clamp (semisToRatio (target - midiIn), 0.25f, 4.0f);
@@ -492,7 +504,7 @@ private:
         {
             haveNote = false;
             hop = uvHop;
-            const float noiseRatio = mode == Mode::Transpose ? semisToRatio (pitch) : 1.0f;
+            const float noiseRatio = mode == Mode::Transpose ? semisToRatio (pitchSm) : 1.0f;
             readRate = link ? noiseRatio : formantRatio;
             halfLen = 2.0 * uvHop / readRate;
             readCentre = nextSyn; // time-aligned so unshifted noise reconstructs exactly
@@ -532,7 +544,8 @@ private:
         }
 
         lastRatio = ratio;
-        nextSyn += std::max (hop, 1.0);
+        lastHop = std::max (hop, 1.0);
+        nextSyn += lastHop;
     }
 
     double sr = 44100.0;
@@ -569,6 +582,9 @@ private:
     float pitch = 0.0f, formant = 0.0f;
     bool link = false;
     float neutralFade = 0.0f, fadeCoeff = 0.001f;
+    float pitchSm = 0.0f, formantSm = 0.0f;
+    bool smoothInit = false;
+    double lastHop = 1.0;
 };
 
 } // namespace txiki
