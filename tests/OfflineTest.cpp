@@ -14,6 +14,7 @@
 #include <iterator>
 #include <fstream>
 #include <numeric>
+#include <random>
 #include <string>
 
 using namespace txiki;
@@ -235,6 +236,101 @@ static double inharmonicDb (const std::vector<float>& x, double sr, size_t start
         (distHz < 12.0 ? harm : inh) += p;
     }
     return 10 * std::log10 ((inh + 1e-30) / (harm + 1e-30));
+}
+
+// Natural-sounding vowel: glottal pulses with jitter (0.8%), shimmer (6%), vibrato and
+// pitch-synchronous aspiration noise through 5 formants. The same seed gives the same
+// voice at any f0 / formant scale, which serves as the ideal output of a shift.
+static std::vector<float> makeNaturalVoice (double sr, double seconds, double f0, double formantScale)
+{
+    std::mt19937 rng (11);
+    std::normal_distribution<double> gauss (0.0, 1.0);
+    std::vector<float> out ((size_t) (sr * seconds));
+    const double freqs[5] = { 650, 1100, 2600, 3300, 4200 }, bws[5] = { 80, 100, 140, 200, 250 }, gains[5] = { 1, 0.7, 0.35, 0.25, 0.15 };
+    std::vector<Resonator> res;
+    for (int k = 0; k < 5; ++k)
+        res.emplace_back (freqs[k] * formantScale, bws[k] * formantScale, sr);
+    double phase = 0.0, prev = 0.0, jitter = 1.0, shimmer = 1.0, noise = 0.0;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        const double t = (double) i / sr;
+        phase += f0 * jitter * std::pow (2.0, 25.0 * std::sin (2 * kPi * 5.2 * t) / 1200.0) / sr;
+        if (phase >= 1.0)
+        {
+            phase -= 1.0;
+            jitter = 1.0 + 0.008 * gauss (rng);
+            shimmer = 1.0 + 0.06 * gauss (rng);
+        }
+        const double open = 0.6;
+        double g = phase < open ? 0.5 * (1.0 - std::cos (kPi * phase / open)) : std::cos (kPi * (phase - open) / (2.0 * (1.0 - open)));
+        g = std::max (0.0, g) * shimmer;
+        const double dg = g - prev;
+        prev = g;
+        noise = gauss (rng) - 0.5 * noise;
+        const double e = dg + 0.004 * noise * (0.3 + g);
+        double s = 0.0;
+        for (int k = 0; k < 5; ++k)
+            s += gains[k] * res[(size_t) k].process (e);
+        out[i] = (float) s;
+    }
+    float peak = 1.0e-9f;
+    for (auto v : out)
+        peak = std::max (peak, std::abs (v));
+    for (auto& v : out)
+        v *= 0.4f / peak;
+    return out;
+}
+
+// Long-term average spectrum in 1/6-octave bands, 150 Hz..8 kHz (dB).
+static std::vector<double> ltasBands (const std::vector<float>& x, double sr, size_t a, size_t b)
+{
+    const size_t n = 4096;
+    std::vector<double> acc (n / 2, 0.0);
+    for (size_t s = a; s + n <= b; s += n / 4)
+    {
+        std::vector<double> re (n), im (n, 0.0);
+        for (size_t i = 0; i < n; ++i)
+            re[i] = x[s + i] * (0.5 - 0.5 * std::cos (2 * kPi * i / (n - 1)));
+        fft (re, im);
+        for (size_t k = 0; k < n / 2; ++k)
+            acc[k] += re[k] * re[k] + im[k] * im[k];
+    }
+    std::vector<double> bands;
+    for (double lo = 150.0; lo < 8000.0; lo *= std::pow (2.0, 1.0 / 6.0))
+    {
+        double e = 1.0e-20;
+        for (size_t k = (size_t) (lo * n / sr); k < (size_t) (lo * std::pow (2.0, 1.0 / 6.0) * n / sr); ++k)
+            e += acc[k];
+        bands.push_back (10.0 * std::log10 (e));
+    }
+    return bands;
+}
+
+// Harmonic-to-valley ratio (dB) in 300 Hz..2.5 kHz: total power over the local spectral floor
+// (min over +-6 bins of a 2048-point spectrum). Lower than the ideal = rough/buzzy output.
+static double harmonicityDb (const std::vector<float>& x, double sr, size_t a, size_t b)
+{
+    const size_t n = 2048;
+    double total = 0.0, floorSum = 0.0;
+    for (size_t s = a; s + n <= b; s += n / 2)
+    {
+        std::vector<double> re (n), im (n, 0.0);
+        for (size_t i = 0; i < n; ++i)
+            re[i] = x[s + i] * (0.5 - 0.5 * std::cos (2 * kPi * i / (n - 1)));
+        fft (re, im);
+        std::vector<double> p (n / 2);
+        for (size_t k = 0; k < n / 2; ++k)
+            p[k] = re[k] * re[k] + im[k] * im[k];
+        for (size_t k = (size_t) (300.0 * n / sr); k < (size_t) (2500.0 * n / sr); ++k)
+        {
+            double mn = 1.0e30;
+            for (size_t d = k - 6; d <= k + 6; ++d)
+                mn = std::min (mn, p[d]);
+            total += p[k];
+            floorSum += mn;
+        }
+    }
+    return 10.0 * std::log10 (total / (floorSum + 1.0e-30));
 }
 
 // Minimal 16-bit PCM / 32-bit float WAV reader (first channel).
@@ -725,6 +821,53 @@ int main (int argc, char** argv)
             std::printf ("alias %-11s inharmonic=%6.1f dB (limit %5.1f, input %6.1f dB) %s\n", ac.name, inh, ac.maxDb, inputInh, ok ? "OK" : "FAIL");
             writeWav (outDir + "/alias_" + ac.name + ".wav", out, (int) sr);
         }
+    }
+
+    // Naturalness: a jittery, breathy voice shifted by the plugin vs. the same voice model
+    // synthesised at the target pitch / formant scale. Robotic or buzzy output shows up as
+    // a spectral-envelope mismatch and as lost harmonicity (grains smearing the pulses).
+    {
+        struct NatCase { const char* name; double f0; float pitch, formant; bool link; };
+        const NatCase natCases[] = {
+            { "m_p+0.3", 110, 0.3f, 0, false }, { "f_p+0.3", 220, 0.3f, 0, false }, { "m_up5", 110, 5, 0, false },
+            { "m_up12", 110, 12, 0, false }, { "m_down7", 110, -7, 0, false }, { "f_up5", 220, 5, 0, false },
+            { "f_down7", 220, -7, 0, false }, { "f_down12", 220, -12, 0, false }, { "m_fmt+5", 110, 0, 5, false },
+            { "m_fmt-5", 110, 0, -5, false }, { "f_fmt+5", 220, 0, 5, false }, { "f_fmt-5", 220, 0, -5, false },
+            { "m_link+7", 110, 7, 0, true }, { "f_p-5_f+3", 220, -5, 3, false },
+        };
+        double envSum = 0.0, harmSum = 0.0;
+        for (const auto& nc : natCases)
+        {
+            const double ratio = std::pow (2.0, nc.pitch / 12.0);
+            const double scale = nc.link ? ratio : std::pow (2.0, nc.formant / 12.0);
+            const auto in = makeNaturalVoice (sr, 3.0, nc.f0, 1.0);
+            const auto ideal = makeNaturalVoice (sr, 3.0, nc.f0 * ratio, scale);
+            VoiceShifter vs;
+            vs.prepare (sr);
+            vs.setParameters (Mode::Transpose, nc.pitch, nc.formant, nc.link);
+            const int lat = vs.getLatencySamples();
+            std::vector<float> out (in.size());
+            for (size_t i = 0; i < in.size() + (size_t) lat; ++i)
+            {
+                const float y = vs.processSample (i < in.size() ? in[i] : 0.0f);
+                if (i >= (size_t) lat)
+                    out[i - (size_t) lat] = y;
+            }
+            const size_t a = (size_t) (0.5 * sr), b = (size_t) (2.9 * sr);
+            const auto po = ltasBands (out, sr, a, b), pi = ltasBands (ideal, sr, a, b);
+            const double env = profileDistance (po, pi);
+            const double hOut = harmonicityDb (out, sr, a, b), hIdeal = harmonicityDb (ideal, sr, a, b);
+            envSum += env;
+            harmSum += std::abs (hOut - hIdeal);
+            std::printf ("natural %-10s envelope dist=%4.1f dB  harmonicity out=%5.1f ideal=%5.1f dB\n", nc.name, env, hOut, hIdeal);
+            writeWav (outDir + "/natural_" + nc.name + ".wav", out, (int) sr);
+        }
+        const double envMean = envSum / std::size (natCases), harmMean = harmSum / std::size (natCases);
+        // Before waveform-matched epochs: 3.23 dB / 3.28 dB.
+        const bool ok = envMean < 2.8 && harmMean < 2.4;
+        if (!ok)
+            ++failures;
+        std::printf ("natural mean envelope dist=%.2f dB (limit 2.8)  harmonicity error=%.2f dB (limit 2.4) %s\n", envMean, harmMean, ok ? "OK" : "FAIL");
     }
 
     // Stereo image: R = 0.5 * L delayed by 15 samples. Output must keep level ratio and inter-channel delay.

@@ -190,7 +190,9 @@ public:
         // Latency budget (see placeGrain/generateMarks):
         //  grains are placed kLookahead*tMax ahead of the output, the nearest epoch can sit
         //  half a period later, and a grain reads at most tMax of source around it.
-        markLag = (int) std::ceil (0.25 * tMax) + 4;
+        //  Marks trail the input by half a max period (free in that budget) so each one can
+        //  be matched against a full period of waveform around it.
+        markLag = (int) std::ceil (0.5 * tMax) + 4;
         latency = (int) std::ceil ((kLookahead + 1.5) * tMax) + std::max (0, markLag - (int) (0.5 * tMax)) + 8;
         uvHop = sr * 0.005;
         fadeCoeff = (float) (1.0 - std::exp (-1.0 / (0.02 * sr)));
@@ -213,6 +215,8 @@ public:
         mask = size - 1;
         inBuf.assign ((size_t) numCh, std::vector<float> ((size_t) size, 0.0f));
         lpBuf.assign ((size_t) size, 0.0f);
+        monoBuf.assign ((size_t) size, 0.0f);
+        corrScore.assign ((size_t) (2 * ((int) (0.2 * tMax) + 1) + 3), 0.0);
         outBuf.assign ((size_t) numCh, std::vector<float> ((size_t) size, 0.0f));
         decBuf.assign ((size_t) yinLen * 2, 0.0f);
         yinScratch.assign ((size_t) yinLen, 0.0f);
@@ -240,6 +244,7 @@ public:
         for (auto& b : inBuf)
             std::fill (b.begin(), b.end(), 0.0f);
         std::fill (lpBuf.begin(), lpBuf.end(), 0.0f);
+        std::fill (monoBuf.begin(), monoBuf.end(), 0.0f);
         for (auto& b : outBuf)
             std::fill (b.begin(), b.end(), 0.0f);
         std::fill (decBuf.begin(), decBuf.end(), 0.0f);
@@ -321,6 +326,7 @@ public:
         lp1 += lpCoeff * (x - lp1);
         lp2 += lpCoeff * (lp1 - lp2);
         lpBuf[(size_t) (inPos & mask)] = lp2;
+        monoBuf[(size_t) (inPos & mask)] = x;
         ++inPos;
 
         feedDetector (x);
@@ -368,7 +374,7 @@ private:
 
     static constexpr int kEstCap = 256;
     static constexpr int kMarkCap = 1024;
-    static constexpr double kEpochPull = 0.15;
+    static constexpr double kEpochPull = 0.05;
     static constexpr int kSincZeros = 6;
     static constexpr int kSincRes = 512;
     std::vector<float> sincTable;
@@ -570,9 +576,13 @@ private:
                 const double den = ym - 2.0 * y0 + yp;
                 const double peakPos = (double) bestIdx + (std::abs (den) > 1.0e-12 ? std::clamp (0.5 * (ym - yp) / den, -0.5, 0.5) : 0.0);
 
-                // Phase-locked epochs: follow the period exactly and only drift slowly
-                // towards the glottal peak; a fresh voiced segment snaps straight to it.
-                double pos = last.voiced ? expected + kEpochPull * (peakPos - expected) : peakPos;
+                // A fresh voiced segment snaps to the glottal peak. After that, each epoch is
+                // the waveform match of the previous one, so marks follow the real cycle-to-cycle
+                // timing (jitter) instead of a smoothed period: grains then hold one pulse each
+                // and the output keeps the voice's natural micro-variation. A slow pull towards
+                // the peak stops the phase from wandering over long notes.
+                double pos = last.voiced ? matchPreviousEpoch (last, expected, centreIdx, radius, period) : peakPos;
+                pos += kEpochPull * (peakPos - pos);
                 pos = std::max (pos, last.pos + period * 0.5);
                 pushMark ({ pos, period, true });
                 nextMarkPos = pos + period;
@@ -587,6 +597,49 @@ private:
                 nextMarkPos = (double) candidate + uvHop;
             }
         }
+    }
+
+    // Position (sub-sample) near `expected` whose surrounding period best matches the one
+    // around the previous epoch: normalised cross-correlation, lightly biased to `expected`.
+    double matchPreviousEpoch (const Mark& last, double expected, int64_t centreIdx, int radius, float period)
+    {
+        const int64_t ref = (int64_t) std::llround (last.pos);
+        const double refFrac = last.pos - (double) ref;
+        const int half = std::max (2, (int) (0.5f * period));
+        const int stride = decim; // the correlation only needs ~44 kHz resolution
+        auto at = [this] (int64_t n) { return monoBuf[(size_t) (n & mask)]; };
+
+        double eRef = 1.0e-12;
+        for (int j = -half; j <= half; j += stride)
+            eRef += (double) at (ref + j) * at (ref + j);
+
+        radius = std::min (radius, (int) corrScore.size() / 2 - 1);
+        int best = 0;
+        for (int o = -radius; o <= radius; ++o)
+        {
+            const int64_t n = centreIdx + o;
+            double xy = 0.0, e = 1.0e-12;
+            for (int j = -half; j <= half; j += stride)
+            {
+                const float v = at (n + j);
+                xy += (double) at (ref + j) * v;
+                e += (double) v * v;
+            }
+            const double dist = ((double) n + refFrac - expected) / radius;
+            double& score = corrScore[(size_t) (o + radius)];
+            score = xy / std::sqrt (eRef * e) - 0.3 * dist * dist;
+            if (score > corrScore[(size_t) best])
+                best = o + radius;
+        }
+        double frac = 0.0;
+        if (best > 0 && best < 2 * radius)
+        {
+            const double ym = corrScore[(size_t) best - 1], y0 = corrScore[(size_t) best], yp = corrScore[(size_t) best + 1];
+            const double den = ym - 2.0 * y0 + yp;
+            if (std::abs (den) > 1.0e-12)
+                frac = std::clamp (0.5 * (ym - yp) / den, -0.5, 0.5);
+        }
+        return (double) (centreIdx + best - radius) + frac + refFrac;
     }
 
     // ---------------------------------------------------------------- synthesis
@@ -771,7 +824,8 @@ private:
 
     int numCh = 1;
     std::vector<std::vector<float>> inBuf, outBuf;
-    std::vector<float> lpBuf, decBuf, yinScratch;
+    std::vector<float> lpBuf, monoBuf, decBuf, yinScratch;
+    std::vector<double> corrScore;
     int64_t inPos = 0;
 
     float lpCoeff = 0.1f, lp1 = 0.0f, lp2 = 0.0f;
